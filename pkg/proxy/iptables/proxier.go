@@ -69,11 +69,11 @@ const (
 	// the kubernetes postrouting chain
 	kubePostroutingChain utiliptables.Chain = "KUBE-POSTROUTING"
 
-	// KubeMarkMasqChain is the mark-for-masquerade chain
-	KubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
+	// kubeMarkMasqChain is the mark-for-masquerade chain
+	kubeMarkMasqChain utiliptables.Chain = "KUBE-MARK-MASQ"
 
-	// KubeMarkDropChain is the mark-for-drop chain
-	KubeMarkDropChain utiliptables.Chain = "KUBE-MARK-DROP"
+	// kubeMarkDropChain is the mark-for-drop chain
+	kubeMarkDropChain utiliptables.Chain = "KUBE-MARK-DROP"
 
 	// the kubernetes forward chain
 	kubeForwardChain utiliptables.Chain = "KUBE-FORWARD"
@@ -392,7 +392,7 @@ var iptablesEnsureChains = []struct {
 	table utiliptables.Table
 	chain utiliptables.Chain
 }{
-	{utiliptables.TableNAT, KubeMarkDropChain},
+	{utiliptables.TableNAT, kubeMarkDropChain},
 }
 
 var iptablesCleanupOnlyChains = []iptablesJumpChain{
@@ -925,7 +925,7 @@ func (proxier *Proxier) syncProxyRules() {
 			proxier.filterChains.Write(utiliptables.MakeChainLine(chainName))
 		}
 	}
-	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain} {
+	for _, chainName := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, kubeMarkMasqChain} {
 		if chain, ok := existingNATChains[chainName]; ok {
 			proxier.natChains.WriteBytes(chain)
 		} else {
@@ -961,7 +961,7 @@ func (proxier *Proxier) syncProxyRules() {
 	// this so that it is easier to flush and change, for example if the mark
 	// value should ever change.
 	proxier.natRules.Write(
-		"-A", string(KubeMarkMasqChain),
+		"-A", string(kubeMarkMasqChain),
 		"-j", "MARK", "--or-mark", proxier.masqueradeMark,
 	)
 
@@ -1042,7 +1042,7 @@ func (proxier *Proxier) syncProxyRules() {
 			proxier.natRules.Write(
 				args,
 				"-s", epInfo.IP(),
-				"-j", string(KubeMarkMasqChain))
+				"-j", string(kubeMarkMasqChain))
 			// Update client-affinity lists.
 			if svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP {
 				args = append(args, "-m", "recent", "--name", string(endpointChain), "--set")
@@ -1114,7 +1114,7 @@ func (proxier *Proxier) syncProxyRules() {
 				proxier.natRules.Write(
 					"-A", string(externalTrafficChain),
 					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade traffic for %s external destinations"`, svcNameString),
-					"-j", string(KubeMarkMasqChain))
+					"-j", string(kubeMarkMasqChain))
 			} else {
 				// If we are only using same-node endpoints, we can retain the
 				// source IP in most cases.
@@ -1138,7 +1138,7 @@ func (proxier *Proxier) syncProxyRules() {
 					"-A", string(externalTrafficChain),
 					"-m", "comment", "--comment", fmt.Sprintf(`"masquerade LOCAL traffic for %s external destinations"`, svcNameString),
 					"-m", "addrtype", "--src-type", "LOCAL",
-					"-j", string(KubeMarkMasqChain))
+					"-j", string(kubeMarkMasqChain))
 
 				// Redirect all src-type=LOCAL -> external destination to the
 				// policy=cluster chain. This allows traffic originating
@@ -1168,7 +1168,7 @@ func (proxier *Proxier) syncProxyRules() {
 				proxier.natRules.Write(
 					"-A", string(internalTrafficChain),
 					args,
-					"-j", string(KubeMarkMasqChain))
+					"-j", string(kubeMarkMasqChain))
 			} else if proxier.localDetector.IsImplemented() {
 				// This masquerades off-cluster traffic to a service VIP.  The idea
 				// is that you can establish a static route for your Service range,
@@ -1178,7 +1178,7 @@ func (proxier *Proxier) syncProxyRules() {
 					"-A", string(internalTrafficChain),
 					args,
 					proxier.localDetector.IfNotLocal(),
-					"-j", string(KubeMarkMasqChain))
+					"-j", string(kubeMarkMasqChain))
 			}
 			proxier.natRules.Write(
 				"-A", string(kubeServicesChain),
@@ -1243,6 +1243,46 @@ func (proxier *Proxier) syncProxyRules() {
 				// The firewall chain will jump to the "external destination"
 				// chain.
 				nextChain = svcInfo.firewallChainName
+
+				// The service firewall rules are created based on the
+				// loadBalancerSourceRanges field.  This only works for
+				// VIP-like loadbalancers that preserve source IPs.  For
+				// loadbalancers which direct traffic to service NodePort, the
+				// firewall rules will not apply.
+				args = append(args[:0],
+					"-A", string(nextChain),
+					"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcNameString),
+				)
+
+				// firewall filter based on each source range
+				allowFromNode := false
+				for _, src := range svcInfo.LoadBalancerSourceRanges() {
+					proxier.natRules.Write(args, "-s", src, "-j", string(externalTrafficChain))
+					_, cidr, err := netutils.ParseCIDRSloppy(src)
+					if err != nil {
+						klog.ErrorS(err, "Error parsing CIDR in LoadBalancerSourceRanges, dropping it", "cidr", cidr)
+					} else if cidr.Contains(proxier.nodeIP) {
+						allowFromNode = true
+					}
+				}
+				// For VIP-like LBs, the VIP is often added as a local
+				// address (via an IP route rule).  In that case, a request
+				// from a node to the VIP will not hit the loadbalancer but
+				// will loop back with the source IP set to the VIP.  We
+				// need the following rules to allow requests from this node.
+				if allowFromNode {
+					for _, lbip := range svcInfo.LoadBalancerIPStrings() {
+						proxier.natRules.Write(
+							args,
+							"-s", lbip,
+							"-j", string(externalTrafficChain))
+					}
+				}
+
+				// If the packet was able to reach the end of firewall chain,
+				// then it did not get DNATed.  It means the packet cannot go
+				// thru the firewall, then mark it for DROP.
+				proxier.natRules.Write(args, "-j", string(kubeMarkDropChain))
 			}
 
 			for _, lbip := range svcInfo.LoadBalancerIPStrings() {
@@ -1254,44 +1294,6 @@ func (proxier *Proxier) syncProxyRules() {
 					"--dport", strconv.Itoa(svcInfo.Port()),
 					"-j", string(nextChain))
 
-				// The service firewall rules are created based on the
-				// loadBalancerSourceRanges field.  This only works for
-				// VIP-like loadbalancers that preserve source IPs.  For
-				// loadbalancers which direct traffic to service NodePort, the
-				// firewall rules will not apply.
-				if len(svcInfo.LoadBalancerSourceRanges()) > 0 {
-					args = append(args[:0],
-						"-A", string(nextChain),
-						"-m", "comment", "--comment", fmt.Sprintf(`"%s loadbalancer IP"`, svcNameString),
-					)
-
-					// firewall filter based on each source range
-					allowFromNode := false
-					for _, src := range svcInfo.LoadBalancerSourceRanges() {
-						proxier.natRules.Write(args, "-s", src, "-j", string(externalTrafficChain))
-						_, cidr, err := netutils.ParseCIDRSloppy(src)
-						if err != nil {
-							klog.ErrorS(err, "Error parsing CIDR in LoadBalancerSourceRanges, dropping it", "cidr", cidr)
-						} else if cidr.Contains(proxier.nodeIP) {
-							allowFromNode = true
-						}
-					}
-					// For VIP-like LBs, the VIP is often added as a local
-					// address (via an IP route rule).  In that case, a request
-					// from a node to the VIP will not hit the loadbalancer but
-					// will loop back with the source IP set to the VIP.  We
-					// need the following rule to allow requests from this node.
-					if allowFromNode {
-						proxier.natRules.Write(
-							args,
-							"-s", lbip,
-							"-j", string(externalTrafficChain))
-					}
-					// If the packet was able to reach the end of firewall chain,
-					// then it did not get DNATed.  It means the packet cannot go
-					// thru the firewall, then mark it for DROP.
-					proxier.natRules.Write(args, "-j", string(KubeMarkDropChain))
-				}
 			}
 		} else {
 			// No endpoints.
@@ -1354,24 +1356,19 @@ func (proxier *Proxier) syncProxyRules() {
 			if len(localEndpoints) != 0 {
 				// Write rules jumping from localPolicyChain to localEndpointChains
 				proxier.writeServiceToEndpointRules(svcNameString, svcInfo, localPolicyChain, localEndpoints, args)
-			} else {
+			} else if hasEndpoints {
 				if svcInfo.InternalPolicyLocal() && utilfeature.DefaultFeatureGate.Enabled(features.ServiceInternalTrafficPolicy) {
 					serviceNoLocalEndpointsTotalInternal++
 				}
 				if svcInfo.ExternalPolicyLocal() {
 					serviceNoLocalEndpointsTotalExternal++
 				}
-				if hasEndpoints {
-					// Blackhole all traffic since there are no local endpoints
-					args = append(args[:0],
-						"-A", string(localPolicyChain),
-						"-m", "comment", "--comment",
-						fmt.Sprintf(`"%s has no local endpoints"`, svcNameString),
-						"-j",
-						string(KubeMarkDropChain),
-					)
-					proxier.natRules.Write(args)
-				}
+				// Blackhole all traffic since there are no local endpoints
+				proxier.natRules.Write(
+					"-A", string(localPolicyChain),
+					"-m", "comment", "--comment",
+					fmt.Sprintf(`"%s has no local endpoints"`, svcNameString),
+					"-j", string(kubeMarkDropChain))
 			}
 		}
 	}
