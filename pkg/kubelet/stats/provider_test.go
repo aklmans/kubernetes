@@ -17,11 +17,12 @@ limitations under the License.
 package stats
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
-	gomock "github.com/golang/mock/gomock"
+	"github.com/golang/mock/gomock"
 	cadvisorapiv1 "github.com/google/cadvisor/info/v1"
 	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
 	fuzz "github.com/google/gofuzz"
@@ -177,6 +178,7 @@ func TestRootFsStats(t *testing.T) {
 }
 
 func TestGetContainerInfo(t *testing.T) {
+	ctx := context.Background()
 	cadvisorAPIFailure := fmt.Errorf("cAdvisor failure")
 	runtimeError := fmt.Errorf("List containers error")
 	tests := []struct {
@@ -336,13 +338,13 @@ func TestGetContainerInfo(t *testing.T) {
 		)
 
 		mockPodManager.EXPECT().TranslatePodUID(tc.requestedPodUID).Return(kubetypes.ResolvedPodUID(tc.requestedPodUID))
-		mockRuntimeCache.EXPECT().GetPods().Return(tc.podList, tc.runtimeError)
+		mockRuntimeCache.EXPECT().GetPods(ctx).Return(tc.podList, tc.runtimeError)
 		if tc.expectDockerContainerCall {
 			mockCadvisor.EXPECT().DockerContainer(tc.containerID, cadvisorReq).Return(tc.cadvisorContainerInfo, tc.mockError)
 		}
 
 		provider := newStatsProvider(mockCadvisor, mockPodManager, mockRuntimeCache, fakeContainerStatsProvider{})
-		stats, err := provider.GetContainerInfo(tc.requestedPodFullName, tc.requestedPodUID, tc.requestedContainerName, cadvisorReq)
+		stats, err := provider.GetContainerInfo(ctx, tc.requestedPodFullName, tc.requestedPodUID, tc.requestedContainerName, cadvisorReq)
 		assert.Equal(t, tc.expectedError, err)
 
 		if tc.expectStats {
@@ -410,6 +412,7 @@ func TestGetRawContainerInfoSubcontainers(t *testing.T) {
 }
 
 func TestHasDedicatedImageFs(t *testing.T) {
+	ctx := context.Background()
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 
@@ -440,13 +443,35 @@ func TestHasDedicatedImageFs(t *testing.T) {
 		provider := newStatsProvider(mockCadvisor, mockPodManager, mockRuntimeCache, fakeContainerStatsProvider{
 			device: test.imagefsDevice,
 		})
-		dedicated, err := provider.HasDedicatedImageFs()
+		dedicated, err := provider.HasDedicatedImageFs(ctx)
 		assert.NoError(t, err)
 		assert.Equal(t, test.dedicated, dedicated)
 	}
 }
 
 func getTerminatedContainerInfo(seed int, podName string, podNamespace string, containerName string) cadvisorapiv2.ContainerInfo {
+	cinfo := getTestContainerInfo(seed, podName, podNamespace, containerName)
+	cinfo.Stats[0].Memory.RSS = 0
+	cinfo.Stats[0].CpuInst.Usage.Total = 0
+	cinfo.Stats[0].Network = &cadvisorapiv2.NetworkStats{
+		Interfaces: []cadvisorapiv1.InterfaceStats{{
+			Name:     "eth0",
+			RxBytes:  0,
+			RxErrors: 0,
+			TxBytes:  0,
+			TxErrors: 0,
+		}, {
+			Name:     "cbr0",
+			RxBytes:  0,
+			RxErrors: 0,
+			TxBytes:  0,
+			TxErrors: 0,
+		}},
+	}
+	return cinfo
+}
+
+func getContainerInfoWithZeroCpuMem(seed int, podName string, podNamespace string, containerName string) cadvisorapiv2.ContainerInfo {
 	cinfo := getTestContainerInfo(seed, podName, podNamespace, containerName)
 	cinfo.Stats[0].Memory.RSS = 0
 	cinfo.Stats[0].CpuInst.Usage.Total = 0
@@ -707,9 +732,11 @@ type fakeResourceAnalyzer struct {
 	podVolumeStats serverstats.PodVolumeStats
 }
 
-func (o *fakeResourceAnalyzer) Start()                                           {}
-func (o *fakeResourceAnalyzer) Get(bool) (*statsapi.Summary, error)              { return nil, nil }
-func (o *fakeResourceAnalyzer) GetCPUAndMemoryStats() (*statsapi.Summary, error) { return nil, nil }
+func (o *fakeResourceAnalyzer) Start()                                               {}
+func (o *fakeResourceAnalyzer) Get(context.Context, bool) (*statsapi.Summary, error) { return nil, nil }
+func (o *fakeResourceAnalyzer) GetCPUAndMemoryStats(context.Context) (*statsapi.Summary, error) {
+	return nil, nil
+}
 func (o *fakeResourceAnalyzer) GetPodVolumeStats(uid types.UID) (serverstats.PodVolumeStats, bool) {
 	return o.podVolumeStats, true
 }
@@ -718,22 +745,22 @@ type fakeContainerStatsProvider struct {
 	device string
 }
 
-func (p fakeContainerStatsProvider) ListPodStats() ([]statsapi.PodStats, error) {
+func (p fakeContainerStatsProvider) ListPodStats(context.Context) ([]statsapi.PodStats, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (p fakeContainerStatsProvider) ListPodStatsAndUpdateCPUNanoCoreUsage() ([]statsapi.PodStats, error) {
+func (p fakeContainerStatsProvider) ListPodStatsAndUpdateCPUNanoCoreUsage(context.Context) ([]statsapi.PodStats, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (p fakeContainerStatsProvider) ListPodCPUAndMemoryStats() ([]statsapi.PodStats, error) {
+func (p fakeContainerStatsProvider) ListPodCPUAndMemoryStats(context.Context) ([]statsapi.PodStats, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (p fakeContainerStatsProvider) ImageFsStats() (*statsapi.FsStats, error) {
+func (p fakeContainerStatsProvider) ImageFsStats(context.Context) (*statsapi.FsStats, error) {
 	return nil, fmt.Errorf("not implemented")
 }
 
-func (p fakeContainerStatsProvider) ImageFsDevice() (string, error) {
+func (p fakeContainerStatsProvider) ImageFsDevice(context.Context) (string, error) {
 	return p.device, nil
 }

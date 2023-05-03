@@ -59,18 +59,18 @@ type TestServerSetup struct {
 type TearDownFunc func()
 
 // StartTestServer runs a kube-apiserver, optionally calling out to the setup.ModifyServerRunOptions and setup.ModifyServerConfig functions
-func StartTestServer(t *testing.T, setup TestServerSetup) (client.Interface, *rest.Config, TearDownFunc) {
+func StartTestServer(t testing.TB, setup TestServerSetup) (client.Interface, *rest.Config, TearDownFunc) {
 	certDir, err := os.MkdirTemp("", "test-integration-"+strings.ReplaceAll(t.Name(), "/", "_"))
 	if err != nil {
 		t.Fatalf("Couldn't create temp dir: %v", err)
 	}
 
-	stopCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
 	var errCh chan error
 	tearDownFn := func() {
-		// Closing stopCh is stopping apiserver and cleaning up
+		// Calling cancel function is stopping apiserver and cleaning up
 		// after itself, including shutting down its storage layer.
-		close(stopCh)
+		cancel()
 
 		// If the apiserver was started, let's wait for it to
 		// shutdown clearly.
@@ -173,7 +173,7 @@ func StartTestServer(t *testing.T, setup TestServerSetup) (client.Interface, *re
 	errCh = make(chan error)
 	go func() {
 		defer close(errCh)
-		if err := kubeAPIServer.GenericAPIServer.PrepareRun().Run(stopCh); err != nil {
+		if err := kubeAPIServer.GenericAPIServer.PrepareRun().Run(ctx.Done()); err != nil {
 			errCh <- err
 		}
 	}()
@@ -203,15 +203,15 @@ func StartTestServer(t *testing.T, setup TestServerSetup) (client.Interface, *re
 		}
 
 		healthStatus := 0
-		kubeClient.Discovery().RESTClient().Get().AbsPath("/healthz").Do(context.TODO()).StatusCode(&healthStatus)
+		kubeClient.Discovery().RESTClient().Get().AbsPath("/healthz").Do(ctx).StatusCode(&healthStatus)
 		if healthStatus != http.StatusOK {
 			return false, nil
 		}
 
-		if _, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), "default", metav1.GetOptions{}); err != nil {
+		if _, err := kubeClient.CoreV1().Namespaces().Get(ctx, "default", metav1.GetOptions{}); err != nil {
 			return false, nil
 		}
-		if _, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), "kube-system", metav1.GetOptions{}); err != nil {
+		if _, err := kubeClient.CoreV1().Namespaces().Get(ctx, "kube-system", metav1.GetOptions{}); err != nil {
 			return false, nil
 		}
 

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -29,54 +28,47 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 
-	flowcontrol "k8s.io/api/flowcontrol/v1beta2"
+	flowcontrol "k8s.io/api/flowcontrol/v1beta3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericfeatures "k8s.io/apiserver/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
-	"k8s.io/kubernetes/pkg/controlplane"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/test/integration/framework"
 )
 
 const (
-	sharedConcurrencyMetricsName      = "apiserver_flowcontrol_request_concurrency_limit"
+	nominalConcurrencyMetricsName     = "apiserver_flowcontrol_nominal_limit_seats"
 	dispatchedRequestCountMetricsName = "apiserver_flowcontrol_dispatched_requests_total"
 	rejectedRequestCountMetricsName   = "apiserver_flowcontrol_rejected_requests_total"
 	labelPriorityLevel                = "priority_level"
 	timeout                           = time.Second * 10
 )
 
-func setup(t testing.TB, maxReadonlyRequestsInFlight, MaxMutatingRequestsInFlight int) (*httptest.Server, *rest.Config, framework.CloseFunc) {
-	opts := framework.ControlPlaneConfigOptions{EtcdOptions: framework.DefaultEtcdOptions()}
-	opts.EtcdOptions.DefaultStorageMediaType = "application/vnd.kubernetes.protobuf"
-	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfigWithOptions(&opts)
-	resourceConfig := controlplane.DefaultAPIResourceConfigSource()
-	resourceConfig.EnableVersions(schema.GroupVersion{
-		Group:   "flowcontrol.apiserver.k8s.io",
-		Version: "v1alpha1",
+func setup(t testing.TB, maxReadonlyRequestsInFlight, MaxMutatingRequestsInFlight int) (*rest.Config, framework.TearDownFunc) {
+	_, kubeConfig, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Ensure all clients are allowed to send requests.
+			opts.Authorization.Modes = []string{"AlwaysAllow"}
+			opts.GenericServerRunOptions.MaxRequestsInFlight = maxReadonlyRequestsInFlight
+			opts.GenericServerRunOptions.MaxMutatingRequestsInFlight = MaxMutatingRequestsInFlight
+		},
 	})
-	controlPlaneConfig.GenericConfig.MaxRequestsInFlight = maxReadonlyRequestsInFlight
-	controlPlaneConfig.GenericConfig.MaxMutatingRequestsInFlight = MaxMutatingRequestsInFlight
-	controlPlaneConfig.GenericConfig.OpenAPIConfig = framework.DefaultOpenAPIConfig()
-	controlPlaneConfig.ExtraConfig.APIResourceConfigSource = resourceConfig
-	_, s, closeFn := framework.RunAnAPIServer(controlPlaneConfig)
-
-	return s, controlPlaneConfig.GenericConfig.LoopbackClientConfig, closeFn
+	return kubeConfig, tearDownFn
 }
 
 func TestPriorityLevelIsolation(t *testing.T) {
 	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, genericfeatures.APIPriorityAndFairness, true)()
 	// NOTE: disabling the feature should fail the test
-	_, loopbackConfig, closeFn := setup(t, 1, 1)
+	kubeConfig, closeFn := setup(t, 1, 1)
 	defer closeFn()
 
-	loopbackClient := clientset.NewForConfigOrDie(loopbackConfig)
-	noxu1Client := getClientFor(loopbackConfig, "noxu1")
-	noxu2Client := getClientFor(loopbackConfig, "noxu2")
+	loopbackClient := clientset.NewForConfigOrDie(kubeConfig)
+	noxu1Client := getClientFor(kubeConfig, "noxu1")
+	noxu2Client := getClientFor(kubeConfig, "noxu2")
 
 	queueLength := 50
 	concurrencyShares := 1
@@ -92,16 +84,16 @@ func TestPriorityLevelIsolation(t *testing.T) {
 		t.Error(err)
 	}
 
-	sharedConcurrency, err := getSharedConcurrencyOfPriorityLevel(loopbackClient)
+	nominalConcurrency, err := getNominalConcurrencyOfPriorityLevel(loopbackClient)
 	if err != nil {
 		t.Error(err)
 	}
 
-	if 1 != sharedConcurrency[priorityLevelNoxu1.Name] {
-		t.Errorf("unexpected shared concurrency %v instead of %v", sharedConcurrency[priorityLevelNoxu1.Name], 1)
+	if 1 != nominalConcurrency[priorityLevelNoxu1.Name] {
+		t.Errorf("unexpected shared concurrency %v instead of %v", nominalConcurrency[priorityLevelNoxu1.Name], 1)
 	}
-	if 1 != sharedConcurrency[priorityLevelNoxu2.Name] {
-		t.Errorf("unexpected shared concurrency %v instead of %v", sharedConcurrency[priorityLevelNoxu2.Name], 1)
+	if 1 != nominalConcurrency[priorityLevelNoxu2.Name] {
+		t.Errorf("unexpected shared concurrency %v instead of %v", nominalConcurrency[priorityLevelNoxu2.Name], 1)
 	}
 
 	stopCh := make(chan struct{})
@@ -153,13 +145,9 @@ func TestPriorityLevelIsolation(t *testing.T) {
 }
 
 func getClientFor(loopbackConfig *rest.Config, username string) clientset.Interface {
-	config := &rest.Config{
-		Host:        loopbackConfig.Host,
-		QPS:         -1,
-		BearerToken: loopbackConfig.BearerToken,
-		Impersonate: rest.ImpersonationConfig{
-			UserName: username,
-		},
+	config := rest.CopyConfig(loopbackConfig)
+	config.Impersonate = rest.ImpersonationConfig{
+		UserName: username,
 	}
 	return clientset.NewForConfigOrDie(config)
 }
@@ -176,7 +164,7 @@ func getMetrics(c clientset.Interface) (string, error) {
 	return string(resp), err
 }
 
-func getSharedConcurrencyOfPriorityLevel(c clientset.Interface) (map[string]int, error) {
+func getNominalConcurrencyOfPriorityLevel(c clientset.Interface) (map[string]int, error) {
 	resp, err := getMetrics(c)
 	if err != nil {
 		return nil, err
@@ -200,7 +188,7 @@ func getSharedConcurrencyOfPriorityLevel(c clientset.Interface) (map[string]int,
 		}
 		for _, metric := range v {
 			switch name := string(metric.Metric[model.MetricNameLabel]); name {
-			case sharedConcurrencyMetricsName:
+			case nominalConcurrencyMetricsName:
 				concurrency[string(metric.Metric[labelPriorityLevel])] = int(metric.Value)
 			}
 		}
@@ -242,14 +230,16 @@ func getRequestCountOfPriorityLevel(c clientset.Interface) (map[string]int, map[
 }
 
 func createPriorityLevelAndBindingFlowSchemaForUser(c clientset.Interface, username string, concurrencyShares, queuelength int) (*flowcontrol.PriorityLevelConfiguration, *flowcontrol.FlowSchema, error) {
-	pl, err := c.FlowcontrolV1beta2().PriorityLevelConfigurations().Create(context.Background(), &flowcontrol.PriorityLevelConfiguration{
+	i0 := int32(0)
+	pl, err := c.FlowcontrolV1beta3().PriorityLevelConfigurations().Create(context.Background(), &flowcontrol.PriorityLevelConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: username,
 		},
 		Spec: flowcontrol.PriorityLevelConfigurationSpec{
 			Type: flowcontrol.PriorityLevelEnablementLimited,
 			Limited: &flowcontrol.LimitedPriorityLevelConfiguration{
-				AssuredConcurrencyShares: int32(concurrencyShares),
+				NominalConcurrencyShares: int32(concurrencyShares),
+				BorrowingLimitPercent:    &i0,
 				LimitResponse: flowcontrol.LimitResponse{
 					Type: flowcontrol.LimitResponseTypeQueue,
 					Queuing: &flowcontrol.QueuingConfiguration{
@@ -264,7 +254,7 @@ func createPriorityLevelAndBindingFlowSchemaForUser(c clientset.Interface, usern
 	if err != nil {
 		return nil, nil, err
 	}
-	fs, err := c.FlowcontrolV1beta2().FlowSchemas().Create(context.TODO(), &flowcontrol.FlowSchema{
+	fs, err := c.FlowcontrolV1beta3().FlowSchemas().Create(context.TODO(), &flowcontrol.FlowSchema{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: username,
 		},
@@ -304,7 +294,7 @@ func createPriorityLevelAndBindingFlowSchemaForUser(c clientset.Interface, usern
 	}
 
 	return pl, fs, wait.Poll(time.Second, timeout, func() (bool, error) {
-		fs, err := c.FlowcontrolV1beta2().FlowSchemas().Get(context.TODO(), username, metav1.GetOptions{})
+		fs, err := c.FlowcontrolV1beta3().FlowSchemas().Get(context.TODO(), username, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}

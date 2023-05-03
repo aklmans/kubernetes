@@ -30,6 +30,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"k8s.io/client-go/dynamic"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	extensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -38,6 +41,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/cel/openapi/resolver"
+	"k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericfeatures "k8s.io/apiserver/pkg/features"
@@ -53,11 +58,13 @@ import (
 	"k8s.io/apiserver/pkg/util/webhook"
 	clientgoinformers "k8s.io/client-go/informers"
 	clientgoclientset "k8s.io/client-go/kubernetes"
+	k8sscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/keyutil"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
+	logsapi "k8s.io/component-base/logs/api/v1"
 	_ "k8s.io/component-base/metrics/prometheus/workqueue" // for workqueue metric registration
 	"k8s.io/component-base/term"
 	"k8s.io/component-base/version"
@@ -82,7 +89,7 @@ import (
 )
 
 func init() {
-	utilruntime.Must(logs.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
+	utilruntime.Must(logsapi.AddFeatureGates(utilfeature.DefaultMutableFeatureGate))
 }
 
 // NewAPIServerCommand creates a *cobra.Command object with default parameters
@@ -109,7 +116,7 @@ cluster's shared state through which all other components interact.`,
 
 			// Activate logging as soon as possible, after that
 			// show flags with the final logging configuration.
-			if err := s.Logs.ValidateAndApply(utilfeature.DefaultFeatureGate); err != nil {
+			if err := logsapi.ValidateAndApply(s.Logs, utilfeature.DefaultFeatureGate); err != nil {
 				return err
 			}
 			cliflag.PrintFlags(fs)
@@ -124,7 +131,8 @@ cluster's shared state through which all other components interact.`,
 			if errs := completedOptions.Validate(); len(errs) != 0 {
 				return utilerrors.NewAggregate(errs)
 			}
-
+			// add feature enablement metrics
+			utilfeature.DefaultMutableFeatureGate.AddMetrics()
 			return Run(completedOptions, genericapiserver.SetupSignalHandler())
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -213,12 +221,7 @@ func CreateServerChain(completedOptions completedServerRunOptions) (*aggregatora
 
 // CreateKubeAPIServer creates and wires a workable kube-apiserver
 func CreateKubeAPIServer(kubeAPIServerConfig *controlplane.Config, delegateAPIServer genericapiserver.DelegationTarget) (*controlplane.Instance, error) {
-	kubeAPIServer, err := kubeAPIServerConfig.Complete().New(delegateAPIServer)
-	if err != nil {
-		return nil, err
-	}
-
-	return kubeAPIServer, nil
+	return kubeAPIServerConfig.Complete().New(delegateAPIServer)
 }
 
 // CreateProxyTransport creates the dialer infrastructure to connect to the nodes.
@@ -247,16 +250,7 @@ func CreateKubeAPIServerConfig(s completedServerRunOptions) (
 		return nil, nil, nil, err
 	}
 
-	capabilities.Initialize(capabilities.Capabilities{
-		AllowPrivileged: s.AllowPrivileged,
-		// TODO(vmarmol): Implement support for HostNetworkSources.
-		PrivilegedSources: capabilities.PrivilegedSources{
-			HostNetworkSources: []string{},
-			HostPIDSources:     []string{},
-			HostIPCSources:     []string{},
-		},
-		PerConnectionBandwidthLimitBytesPerSec: s.MaxConnectionBytesPerSec,
-	})
+	capabilities.Setup(s.AllowPrivileged, s.MaxConnectionBytesPerSec)
 
 	s.Metrics.Apply()
 	serviceaccount.RegisterMetrics()
@@ -288,9 +282,6 @@ func CreateKubeAPIServerConfig(s completedServerRunOptions) (
 			ExtendExpiration:            s.Authentication.ServiceAccounts.ExtendExpiration,
 
 			VersionedInformers: versionedInformers,
-
-			IdentityLeaseDurationSeconds:      s.IdentityLeaseDurationSeconds,
-			IdentityLeaseRenewIntervalSeconds: s.IdentityLeaseRenewIntervalSeconds,
 		},
 	}
 
@@ -387,12 +378,11 @@ func buildGenericConfig(
 	}
 	// wrap the definitions to revert any changes from disabled features
 	getOpenAPIDefinitions := openapi.GetOpenAPIDefinitionsWithoutDisabledFeatures(generatedopenapi.GetOpenAPIDefinitions)
-	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
+	namer := openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme)
+	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(getOpenAPIDefinitions, namer)
 	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.OpenAPIV3) {
-		genericConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
-		genericConfig.OpenAPIV3Config.Info.Title = "Kubernetes"
-	}
+	genericConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(getOpenAPIDefinitions, namer)
+	genericConfig.OpenAPIV3Config.Info.Title = "Kubernetes"
 
 	genericConfig.LongRunningFunc = filters.BasicLongRunningRequestCheck(
 		sets.NewString("watch", "proxy"),
@@ -402,22 +392,23 @@ func buildGenericConfig(
 	kubeVersion := version.Get()
 	genericConfig.Version = &kubeVersion
 
+	if genericConfig.EgressSelector != nil {
+		s.Etcd.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+		s.Etcd.StorageConfig.Transport.TracerProvider = genericConfig.TracerProvider
+	} else {
+		s.Etcd.StorageConfig.Transport.TracerProvider = oteltrace.NewNoopTracerProvider()
+	}
+	if lastErr = s.Etcd.Complete(genericConfig.StorageObjectCountTracker, genericConfig.DrainedNotify(), genericConfig.AddPostStartHook); lastErr != nil {
+		return
+	}
+
 	storageFactoryConfig := kubeapiserver.NewStorageFactoryConfig()
 	storageFactoryConfig.APIResourceConfig = genericConfig.MergedResourceConfig
-	completedStorageFactoryConfig, err := storageFactoryConfig.Complete(s.Etcd)
-	if err != nil {
-		lastErr = err
-		return
-	}
-	storageFactory, lastErr = completedStorageFactoryConfig.New()
+	storageFactory, lastErr = storageFactoryConfig.Complete(s.Etcd).New()
 	if lastErr != nil {
 		return
-	}
-	if genericConfig.EgressSelector != nil {
-		storageFactory.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
-	}
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) && genericConfig.TracerProvider != nil {
-		storageFactory.StorageConfig.Transport.TracerProvider = genericConfig.TracerProvider
 	}
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
@@ -465,16 +456,24 @@ func buildGenericConfig(
 		CloudConfigFile:      s.CloudProvider.CloudConfigFile,
 	}
 	serviceResolver = buildServiceResolver(s.EnableAggregatorRouting, genericConfig.LoopbackClientConfig.Host, versionedInformers)
-	pluginInitializers, admissionPostStartHook, err = admissionConfig.New(proxyTransport, genericConfig.EgressSelector, serviceResolver, genericConfig.TracerProvider)
+	schemaResolver := resolver.NewDefinitionsSchemaResolver(k8sscheme.Scheme, genericConfig.OpenAPIConfig.GetDefinitions)
+	pluginInitializers, admissionPostStartHook, err = admissionConfig.New(proxyTransport, genericConfig.EgressSelector, serviceResolver, genericConfig.TracerProvider, schemaResolver)
 	if err != nil {
 		lastErr = fmt.Errorf("failed to create admission plugin initializer: %v", err)
+		return
+	}
+
+	dynamicExternalClient, err := dynamic.NewForConfig(kubeClientConfig)
+	if err != nil {
+		lastErr = fmt.Errorf("failed to create real dynamic external client: %w", err)
 		return
 	}
 
 	err = s.Admission.ApplyTo(
 		genericConfig,
 		versionedInformers,
-		kubeClientConfig,
+		clientgoExternalClient,
+		dynamicExternalClient,
 		utilfeature.DefaultFeatureGate,
 		pluginInitializers...)
 	if err != nil {
@@ -484,6 +483,9 @@ func buildGenericConfig(
 
 	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIPriorityAndFairness) && s.GenericServerRunOptions.EnablePriorityAndFairness {
 		genericConfig.FlowControl, lastErr = BuildPriorityAndFairness(s, clientgoExternalClient, versionedInformers)
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+		genericConfig.AggregatedDiscoveryGroupManager = aggregated.NewResourceManager("apis")
 	}
 
 	return
@@ -511,7 +513,7 @@ func BuildPriorityAndFairness(s *options.ServerRunOptions, extclient clientgocli
 	}
 	return utilflowcontrol.New(
 		versionedInformer,
-		extclient.FlowcontrolV1beta2(),
+		extclient.FlowcontrolV1beta3(),
 		s.GenericServerRunOptions.MaxRequestsInFlight+s.GenericServerRunOptions.MaxMutatingRequestsInFlight,
 		s.GenericServerRunOptions.RequestTimeout/4,
 	), nil
@@ -549,11 +551,11 @@ func Complete(s *options.ServerRunOptions) (completedServerRunOptions, error) {
 		if len(s.GenericServerRunOptions.AdvertiseAddress) > 0 {
 			s.GenericServerRunOptions.ExternalHost = s.GenericServerRunOptions.AdvertiseAddress.String()
 		} else {
-			if hostname, err := os.Hostname(); err == nil {
-				s.GenericServerRunOptions.ExternalHost = hostname
-			} else {
+			hostname, err := os.Hostname()
+			if err != nil {
 				return options, fmt.Errorf("error finding host name: %v", err)
 			}
+			s.GenericServerRunOptions.ExternalHost = hostname
 		}
 		klog.Infof("external host was not specified, using %v", s.GenericServerRunOptions.ExternalHost)
 	}
@@ -636,7 +638,27 @@ func Complete(s *options.ServerRunOptions) (completedServerRunOptions, error) {
 	return options, nil
 }
 
+var testServiceResolver webhook.ServiceResolver
+
+// SetServiceResolverForTests allows the service resolver to be overridden during tests.
+// Tests using this function must run serially as this function is not safe to call concurrently with server start.
+func SetServiceResolverForTests(resolver webhook.ServiceResolver) func() {
+	if testServiceResolver != nil {
+		panic("test service resolver is set: tests are either running concurrently or clean up was skipped")
+	}
+
+	testServiceResolver = resolver
+
+	return func() {
+		testServiceResolver = nil
+	}
+}
+
 func buildServiceResolver(enabledAggregatorRouting bool, hostname string, informer clientgoinformers.SharedInformerFactory) webhook.ServiceResolver {
+	if testServiceResolver != nil {
+		return testServiceResolver
+	}
+
 	var serviceResolver webhook.ServiceResolver
 	if enabledAggregatorRouting {
 		serviceResolver = aggregatorapiserver.NewEndpointServiceResolver(

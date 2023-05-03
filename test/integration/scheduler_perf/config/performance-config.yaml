@@ -1,16 +1,17 @@
 - name: SchedulingBasic
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-default.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-default.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-default.yaml
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -22,25 +23,24 @@
       measurePods: 1000
 
 - name: SchedulingPodAntiAffinity
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-pod-anti-affinity.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: sched
     count: 2
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-pod-anti-affinity.yaml
     namespace: sched-0
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-pod-anti-affinity.yaml
     collectMetrics: true
     namespace: sched-1
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 100
@@ -52,18 +52,19 @@
       measurePods: 1000
 
 - name: SchedulingSecrets
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-secret-volume.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-secret-volume.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-secret-volume.yaml
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -75,6 +76,7 @@
       measurePods: 1000
 
 - name: SchedulingInTreePVs
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -89,6 +91,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -100,9 +103,7 @@
       measurePods: 1000
 
 - name: SchedulingMigratedInTreePVs
-  featureGates:
-    CSIMigration: true
-    CSIMigrationAWS: true
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -126,6 +127,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -137,6 +139,7 @@
       measurePods: 1000
 
 - name: SchedulingCSIPVs
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -158,6 +161,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -169,6 +173,8 @@
       measurePods: 1000
 
 - name: SchedulingPodAffinity
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-pod-affinity.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -181,15 +187,14 @@
     count: 2
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-pod-affinity.yaml
     namespace: sched-0
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-pod-affinity.yaml
     namespace: sched-1
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -201,25 +206,24 @@
       measurePods: 1000
 
 - name: SchedulingPreferredPodAffinity
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-preferred-pod-affinity.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: sched
     count: 2
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-preferred-pod-affinity.yaml
     namespace: sched-0
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-preferred-pod-affinity.yaml
     namespace: sched-1
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -231,25 +235,24 @@
       measurePods: 1000
 
 - name: SchedulingPreferredPodAntiAffinity
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-preferred-pod-affinity.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: sched
     count: 2
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-preferred-pod-anti-affinity.yaml
     namespace: sched-0
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-preferred-pod-anti-affinity.yaml
     namespace: sched-1
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -261,6 +264,8 @@
       measurePods: 1000
 
 - name: SchedulingNodeAffinity
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-with-node-affinity.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -270,13 +275,12 @@
       labelValues: ["zone1"]
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-with-node-affinity.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-with-node-affinity.yaml
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 500
@@ -288,6 +292,7 @@
       measurePods: 1000
 
 - name: TopologySpreading
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -304,6 +309,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 1000
@@ -315,6 +321,7 @@
       measurePods: 2000
 
 - name: PreferredTopologySpreading
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -331,6 +338,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 1000
@@ -342,6 +350,8 @@
       measurePods: 2000
 
 - name: MixedSchedulingBasePod
+  labels: [performance]
+  defaultPodTemplatePath: config/pod-default.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -354,7 +364,6 @@
     count: 1
   - opcode: createPods
     countParam: $initPods
-    podTemplatePath: config/pod-default.yaml
     namespace: sched-0
   - opcode: createPods
     countParam: $initPods
@@ -374,10 +383,10 @@
     namespace: sched-0
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-default.yaml
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 200
@@ -389,6 +398,7 @@
       measurePods: 1000
 
 - name: PreemptionBasic
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -407,7 +417,7 @@
       measurePods: 500
 # This test case always seems to fail.
 # https://github.com/kubernetes/kubernetes/issues/108308
-# 
+#
 #  - name: 5000Nodes
 #    params:
 #      initNodes: 5000
@@ -415,6 +425,7 @@
 #      measurePods: 5000
 
 - name: PreemptionPVs
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -429,13 +440,14 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 2000
       measurePods: 500
 # This test case always seems to fail.
 # https://github.com/kubernetes/kubernetes/issues/108308
-# 
+#
 #  - name: 5000Nodes
 #    params:
 #      initNodes: 5000
@@ -443,6 +455,7 @@
 #      measurePods: 5000
 
 - name: Unschedulable
+  labels: [performance]
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -456,6 +469,7 @@
     collectMetrics: true
   workloads:
   - name: 500Nodes/200InitPods
+    labels: [fast]
     params:
       initNodes: 500
       initPods: 200
@@ -489,6 +503,7 @@
     collectMetrics: true
   workloads:
   - name: 1000Nodes
+    labels: [fast]
     params:
       initNodes: 1000
       measurePods: 1000
@@ -498,13 +513,10 @@
       measurePods: 2000
 
 - name: SchedulingRequiredPodAntiAffinityWithNSSelector
-  featureGates:
-    PodAffinityNamespaceSelector: true
+  defaultPodTemplatePath: config/pod-anti-affinity-ns-selector.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: init-ns
     countParam: $initNamespaces
@@ -519,10 +531,8 @@
     createPodsOp:
       opcode: createPods
       countParam: $initPodsPerNamespace
-      podTemplatePath: config/pod-anti-affinity-ns-selector.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-anti-affinity-ns-selector.yaml
     collectMetrics: true
     namespace: measure-ns-0
   workloads:
@@ -534,13 +544,10 @@
       measurePods: 1000
 
 - name: SchedulingPreferredAntiAffinityWithNSSelector
-  featureGates:
-    PodAffinityNamespaceSelector: true
+  defaultPodTemplatePath: config/pod-preferred-anti-affinity-ns-selector.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: init-ns
     countParam: $initNamespaces
@@ -555,10 +562,8 @@
     createPodsOp:
       opcode: createPods
       countParam: $initPodsPerNamespace
-      podTemplatePath: config/pod-preferred-anti-affinity-ns-selector.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-preferred-anti-affinity-ns-selector.yaml
     collectMetrics: true
     namespace: measure-ns-0
   workloads:
@@ -570,8 +575,7 @@
       measurePods: 1000
 
 - name: SchedulingRequiredPodAffinityWithNSSelector
-  featureGates:
-    PodAffinityNamespaceSelector: true
+  defaultPodTemplatePath: config/pod-affinity-ns-selector.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
@@ -592,10 +596,8 @@
     createPodsOp:
       opcode: createPods
       countParam: $initPodsPerNamespace
-      podTemplatePath: config/pod-affinity-ns-selector.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-affinity-ns-selector.yaml
     collectMetrics: true
     namespace: measure-ns-0
   workloads:
@@ -607,13 +609,10 @@
       measurePods: 1000
 
 - name: SchedulingPreferredAffinityWithNSSelector
-  featureGates:
-    PodAffinityNamespaceSelector: true
+  defaultPodTemplatePath: config/pod-preferred-affinity-ns-selector.yaml
   workloadTemplate:
   - opcode: createNodes
     countParam: $initNodes
-    uniqueNodeLabelStrategy:
-      labelKey: kubernetes.io/hostname
   - opcode: createNamespaces
     prefix: init-ns
     countParam: $initNamespaces
@@ -628,10 +627,8 @@
     createPodsOp:
       opcode: createPods
       countParam: $initPodsPerNamespace
-      podTemplatePath: config/pod-preferred-affinity-ns-selector.yaml
   - opcode: createPods
     countParam: $measurePods
-    podTemplatePath: config/pod-preferred-affinity-ns-selector.yaml
     collectMetrics: true
     namespace: measure-ns-0
   workloads:
@@ -642,3 +639,28 @@
       initNamespaces: 100
       measurePods: 1000
 
+- name: SchedulingWithNodeInclusionPolicy
+  featureGates:
+    NodeInclusionPolicyInPodTopologySpread: true
+  defaultPodTemplatePath: config/pod-with-node-inclusion-policy.yaml
+  workloadTemplate:
+  - opcode: createNodes
+    countParam: $normalNodes
+  - opcode: createNodes
+    nodeTemplatePath: config/node-with-taint.yaml
+    countParam: $taintNodes
+  - opcode: createPods
+    countParam: $measurePods
+    collectMetrics: true
+  workloads:
+  - name: 500Nodes
+    labels: [fast]
+    params:
+      taintNodes: 100
+      normalNodes: 400
+      measurePods: 400
+  - name: 5000Nodes
+    params:
+      taintNodes: 1000
+      normalNodes: 4000
+      measurePods: 4000

@@ -20,8 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -31,23 +30,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/apiserver/pkg/admission"
-	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
-	"k8s.io/apiserver/pkg/admission/plugin/resourcequota"
-	resourcequotaapi "k8s.io/apiserver/pkg/admission/plugin/resourcequota/apis/resourcequota"
 	"k8s.io/apiserver/pkg/quota/v1/generic"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
-	restclient "k8s.io/client-go/rest"
 	watchtools "k8s.io/client-go/tools/watch"
+	"k8s.io/klog/v2/ktesting"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/pkg/controller"
 	replicationcontroller "k8s.io/kubernetes/pkg/controller/replication"
 	resourcequotacontroller "k8s.io/kubernetes/pkg/controller/resourcequota"
-	kubeapiserveradmission "k8s.io/kubernetes/pkg/kubeapiserver/admission"
 	quotainstall "k8s.io/kubernetes/pkg/quota/v1/install"
 	"k8s.io/kubernetes/test/integration/framework"
 )
@@ -57,50 +51,33 @@ const (
 )
 
 // 1.2 code gets:
-// 	quota_test.go:95: Took 4.218619579s to scale up without quota
-// 	quota_test.go:199: unexpected error: timed out waiting for the condition, ended with 342 pods (1 minute)
+//
+//	quota_test.go:95: Took 4.218619579s to scale up without quota
+//	quota_test.go:199: unexpected error: timed out waiting for the condition, ended with 342 pods (1 minute)
+//
 // 1.3+ code gets:
-// 	quota_test.go:100: Took 4.196205966s to scale up without quota
-// 	quota_test.go:115: Took 12.021640372s to scale up with quota
+//
+//	quota_test.go:100: Took 4.196205966s to scale up without quota
+//	quota_test.go:115: Took 12.021640372s to scale up with quota
 func TestQuota(t *testing.T) {
 	// Set up a API server
-	h := &framework.APIServerHolder{Initialized: make(chan struct{})}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		<-h.Initialized
-		h.M.GenericAPIServer.Handler.ServeHTTP(w, req)
-	}))
+	_, kubeConfig, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+		},
+	})
+	defer tearDownFn()
 
-	admissionCh := make(chan struct{})
-	defer close(admissionCh)
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{QPS: -1, Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
-	config := &resourcequotaapi.Configuration{}
-	admissionControl, err := resourcequota.NewResourceQuota(config, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	internalInformers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
-	qca := quotainstall.NewQuotaConfigurationForAdmission()
+	clientset := clientset.NewForConfigOrDie(kubeConfig)
 
-	initializers := admission.PluginInitializers{
-		genericadmissioninitializer.New(clientset, internalInformers, nil, nil, admissionCh),
-		kubeapiserveradmission.NewPluginInitializer(nil, nil, qca),
-	}
-	initializers.Initialize(admissionControl)
-	if err := admission.ValidateInitialization(admissionControl); err != nil {
-		t.Fatalf("couldn't initialize resource quota: %v", err)
-	}
+	ns := framework.CreateNamespaceOrDie(clientset, "quotaed", t)
+	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
+	ns2 := framework.CreateNamespaceOrDie(clientset, "non-quotaed", t)
+	defer framework.DeleteNamespaceOrDie(clientset, ns2, t)
 
-	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
-	controlPlaneConfig.GenericConfig.AdmissionControl = admissionControl
-	_, _, closeFn := framework.RunAnAPIServerUsingServer(controlPlaneConfig, s, h)
-	defer closeFn()
-
-	ns := framework.CreateTestingNamespace("quotaed", t)
-	defer framework.DeleteTestingNamespace(ns, t)
-	ns2 := framework.CreateTestingNamespace("non-quotaed", t)
-	defer framework.DeleteTestingNamespace(ns2, t)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	informers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
@@ -127,16 +104,15 @@ func TestQuota(t *testing.T) {
 		InformersStarted:          informersStarted,
 		Registry:                  generic.NewRegistry(qc.Evaluators()),
 	}
-	resourceQuotaController, err := resourcequotacontroller.NewController(resourceQuotaControllerOptions)
+	resourceQuotaController, err := resourcequotacontroller.NewController(ctx, resourceQuotaControllerOptions)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	go resourceQuotaController.Run(ctx, 2)
 
 	// Periodically the quota controller to detect new resource types
-	go resourceQuotaController.Sync(discoveryFunc, 30*time.Second, ctx.Done())
+	go resourceQuotaController.Sync(ctx, discoveryFunc, 30*time.Second)
 
-	internalInformers.Start(ctx.Done())
 	informers.Start(ctx.Done())
 	close(informersStarted)
 
@@ -292,51 +268,46 @@ func scale(t *testing.T, namespace string, clientset *clientset.Clientset) {
 }
 
 func TestQuotaLimitedResourceDenial(t *testing.T) {
-	// Set up an API server
-	h := &framework.APIServerHolder{Initialized: make(chan struct{})}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		<-h.Initialized
-		h.M.GenericAPIServer.Handler.ServeHTTP(w, req)
-	}))
-
-	admissionCh := make(chan struct{})
-	defer close(admissionCh)
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{QPS: -1, Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
-
-	// stop creation of a pod resource unless there is a quota
-	config := &resourcequotaapi.Configuration{
-		LimitedResources: []resourcequotaapi.LimitedResource{
-			{
-				Resource:      "pods",
-				MatchContains: []string{"pods"},
-			},
-		},
-	}
-	qca := quotainstall.NewQuotaConfigurationForAdmission()
-	admissionControl, err := resourcequota.NewResourceQuota(config, 5)
+	// Create admission configuration with ResourceQuota configuration.
+	admissionConfigFile, err := os.CreateTemp("", "admission-config.yaml")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	externalInformers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
-
-	initializers := admission.PluginInitializers{
-		genericadmissioninitializer.New(clientset, externalInformers, nil, nil, admissionCh),
-		kubeapiserveradmission.NewPluginInitializer(nil, nil, qca),
+	defer os.Remove(admissionConfigFile.Name())
+	if err := os.WriteFile(admissionConfigFile.Name(), []byte(`
+apiVersion: apiserver.k8s.io/v1alpha1
+kind: AdmissionConfiguration
+plugins:
+- name: ResourceQuota
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: ResourceQuotaConfiguration
+    limitedResources:
+    - resource: pods
+      matchContains:
+      - pods
+`), os.FileMode(0644)); err != nil {
+		t.Fatal(err)
 	}
-	initializers.Initialize(admissionControl)
-	if err := admission.ValidateInitialization(admissionControl); err != nil {
-		t.Fatalf("couldn't initialize resource quota: %v", err)
-	}
 
-	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
-	controlPlaneConfig.GenericConfig.AdmissionControl = admissionControl
-	_, _, closeFn := framework.RunAnAPIServerUsingServer(controlPlaneConfig, s, h)
-	defer closeFn()
+	// Set up an API server
+	_, kubeConfig, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Admission.GenericAdmission.ConfigFile = admissionConfigFile.Name()
 
-	ns := framework.CreateTestingNamespace("quota", t)
-	defer framework.DeleteTestingNamespace(ns, t)
+		},
+	})
+	defer tearDownFn()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	clientset := clientset.NewForConfigOrDie(kubeConfig)
+
+	ns := framework.CreateNamespaceOrDie(clientset, "quota", t)
+	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
+
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	informers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
@@ -363,16 +334,15 @@ func TestQuotaLimitedResourceDenial(t *testing.T) {
 		InformersStarted:          informersStarted,
 		Registry:                  generic.NewRegistry(qc.Evaluators()),
 	}
-	resourceQuotaController, err := resourcequotacontroller.NewController(resourceQuotaControllerOptions)
+	resourceQuotaController, err := resourcequotacontroller.NewController(ctx, resourceQuotaControllerOptions)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	go resourceQuotaController.Run(ctx, 2)
 
 	// Periodically the quota controller to detect new resource types
-	go resourceQuotaController.Sync(discoveryFunc, 30*time.Second, ctx.Done())
+	go resourceQuotaController.Sync(ctx, discoveryFunc, 30*time.Second)
 
-	externalInformers.Start(ctx.Done())
 	informers.Start(ctx.Done())
 	close(informersStarted)
 
@@ -425,52 +395,46 @@ func TestQuotaLimitedResourceDenial(t *testing.T) {
 }
 
 func TestQuotaLimitService(t *testing.T) {
+	// Create admission configuration with ResourceQuota configuration.
+	admissionConfigFile, err := os.CreateTemp("", "admission-config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(admissionConfigFile.Name())
+	if err := os.WriteFile(admissionConfigFile.Name(), []byte(`
+apiVersion: apiserver.k8s.io/v1alpha1
+kind: AdmissionConfiguration
+plugins:
+- name: ResourceQuota
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: ResourceQuotaConfiguration
+    limitedResources:
+    - resource: pods
+      matchContains:
+      - pods
+`), os.FileMode(0644)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Set up an API server
-	h := &framework.APIServerHolder{Initialized: make(chan struct{})}
-	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		<-h.Initialized
-		h.M.GenericAPIServer.Handler.ServeHTTP(w, req)
-	}))
+	_, kubeConfig, tearDownFn := framework.StartTestServer(t, framework.TestServerSetup{
+		ModifyServerRunOptions: func(opts *options.ServerRunOptions) {
+			// Disable ServiceAccount admission plugin as we don't have serviceaccount controller running.
+			opts.Admission.GenericAdmission.DisablePlugins = []string{"ServiceAccount"}
+			opts.Admission.GenericAdmission.ConfigFile = admissionConfigFile.Name()
 
-	admissionCh := make(chan struct{})
-	defer close(admissionCh)
-	clientset := clientset.NewForConfigOrDie(&restclient.Config{QPS: -1, Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: &schema.GroupVersion{Group: "", Version: "v1"}}})
-
-	// stop creation of a pod resource unless there is a quota
-	config := &resourcequotaapi.Configuration{
-		LimitedResources: []resourcequotaapi.LimitedResource{
-			{
-				Resource:      "pods",
-				MatchContains: []string{"pods"},
-			},
 		},
-	}
-	qca := quotainstall.NewQuotaConfigurationForAdmission()
-	admissionControl, err := resourcequota.NewResourceQuota(config, 5)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	externalInformers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
+	})
+	defer tearDownFn()
 
-	initializers := admission.PluginInitializers{
-		genericadmissioninitializer.New(clientset, externalInformers, nil, nil, admissionCh),
-		kubeapiserveradmission.NewPluginInitializer(nil, nil, qca),
-	}
-	initializers.Initialize(admissionControl)
-	if err := admission.ValidateInitialization(admissionControl); err != nil {
-		t.Fatalf("couldn't initialize resource quota: %v", err)
-	}
+	clientset := clientset.NewForConfigOrDie(kubeConfig)
 
-	controlPlaneConfig := framework.NewIntegrationTestControlPlaneConfig()
-	controlPlaneConfig.GenericConfig.AdmissionControl = admissionControl
-	_, _, closeFn := framework.RunAnAPIServerUsingServer(controlPlaneConfig, s, h)
-	defer closeFn()
+	ns := framework.CreateNamespaceOrDie(clientset, "quota", t)
+	defer framework.DeleteNamespaceOrDie(clientset, ns, t)
 
-	ns := framework.CreateTestingNamespace("quota", t)
-	defer framework.DeleteTestingNamespace(ns, t)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	_, ctx := ktesting.NewTestContext(t)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	informers := informers.NewSharedInformerFactory(clientset, controller.NoResyncPeriodFunc())
@@ -497,16 +461,15 @@ func TestQuotaLimitService(t *testing.T) {
 		InformersStarted:          informersStarted,
 		Registry:                  generic.NewRegistry(qc.Evaluators()),
 	}
-	resourceQuotaController, err := resourcequotacontroller.NewController(resourceQuotaControllerOptions)
+	resourceQuotaController, err := resourcequotacontroller.NewController(ctx, resourceQuotaControllerOptions)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	go resourceQuotaController.Run(ctx, 2)
 
 	// Periodically the quota controller to detect new resource types
-	go resourceQuotaController.Sync(discoveryFunc, 30*time.Second, ctx.Done())
+	go resourceQuotaController.Sync(ctx, discoveryFunc, 30*time.Second)
 
-	externalInformers.Start(ctx.Done())
 	informers.Start(ctx.Done())
 	close(informersStarted)
 

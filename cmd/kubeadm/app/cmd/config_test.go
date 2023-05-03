@@ -34,7 +34,6 @@ import (
 	"k8s.io/utils/exec"
 	fakeexec "k8s.io/utils/exec/testing"
 
-	kubeadmapiv1old "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
 	kubeadmapiv1 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	outputapischeme "k8s.io/kubernetes/cmd/kubeadm/app/apis/output/scheme"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
@@ -83,10 +82,14 @@ func TestImagesListRunWithCustomConfigPath(t *testing.T) {
 				constants.CurrentKubernetesVersion.String(),
 			},
 			configContents: []byte(dedent.Dedent(fmt.Sprintf(`
-				apiVersion: %s
-				kind: ClusterConfiguration
-				kubernetesVersion: %s
-			`, kubeadmapiv1.SchemeGroupVersion.String(), constants.CurrentKubernetesVersion))),
+apiVersion: %s
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: %s
+---
+apiVersion: %[1]s
+kind: ClusterConfiguration
+kubernetesVersion: %[3]s`, kubeadmapiv1.SchemeGroupVersion.String(), constants.UnknownCRISocket, constants.CurrentKubernetesVersion))),
 		},
 		{
 			name:               "use coredns",
@@ -95,10 +98,14 @@ func TestImagesListRunWithCustomConfigPath(t *testing.T) {
 				"coredns",
 			},
 			configContents: []byte(dedent.Dedent(fmt.Sprintf(`
-				apiVersion: %s
-				kind: ClusterConfiguration
-				kubernetesVersion: %s
-			`, kubeadmapiv1.SchemeGroupVersion.String(), constants.MinimumControlPlaneVersion))),
+apiVersion: %s
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: %s
+---
+apiVersion: %[1]s
+kind: ClusterConfiguration
+kubernetesVersion: %[3]s`, kubeadmapiv1.SchemeGroupVersion.String(), constants.UnknownCRISocket, constants.MinimumControlPlaneVersion))),
 		},
 	}
 
@@ -354,7 +361,7 @@ func TestImagesPull(t *testing.T) {
 		},
 	}
 
-	fexec := fakeexec.FakeExec{
+	fexec := &fakeexec.FakeExec{
 		CommandScript: []fakeexec.FakeCommandAction{
 			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
 			func(cmd string, args ...string) exec.Cmd { return fakeexec.InitFakeCmd(&fcmd, cmd, args...) },
@@ -365,7 +372,7 @@ func TestImagesPull(t *testing.T) {
 		LookPathFunc: func(cmd string) (string, error) { return "/usr/bin/crictl", nil },
 	}
 
-	containerRuntime, err := utilruntime.NewContainerRuntime(&fexec, constants.DefaultCRISocket)
+	containerRuntime, err := utilruntime.NewContainerRuntime(fexec, constants.DefaultCRISocket)
 	if err != nil {
 		t.Errorf("unexpected NewContainerRuntime error: %v", err)
 	}
@@ -385,10 +392,12 @@ func TestImagesPull(t *testing.T) {
 
 func TestMigrate(t *testing.T) {
 	cfg := []byte(dedent.Dedent(fmt.Sprintf(`
-		# This is intentionally testing an old API version. Sometimes this may be the latest version (if no old configs are supported).
-		apiVersion: %s
-		kind: InitConfiguration
-	`, kubeadmapiv1old.SchemeGroupVersion.String())))
+        # This is intentionally testing an old API version. Sometimes this may be the latest version (if no old configs are supported).
+        apiVersion: %s
+        kind: InitConfiguration
+        nodeRegistration:
+          criSocket: %s
+	`, kubeadmapiv1.SchemeGroupVersion.String(), constants.UnknownCRISocket)))
 	configFile, cleanup := tempConfig(t, cfg)
 	defer cleanup()
 

@@ -24,8 +24,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 
-	v1 "k8s.io/api/core/v1"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,11 +37,11 @@ import (
 
 // Tests that the apiserver retries patches
 func TestPatchConflicts(t *testing.T) {
-	_, clientSet, closeFn := setup(t)
-	defer closeFn()
+	clientSet, _, tearDownFn := setup(t)
+	defer tearDownFn()
 
-	ns := framework.CreateTestingNamespace("status-code", t)
-	defer framework.DeleteTestingNamespace(ns, t)
+	ns := framework.CreateNamespaceOrDie(clientSet, "status-code", t)
+	defer framework.DeleteNamespaceOrDie(clientSet, ns, t)
 
 	numOfConcurrentPatches := 100
 
@@ -56,7 +58,7 @@ func TestPatchConflicts(t *testing.T) {
 			UID:        uid,
 		})
 	}
-	secret := &v1.Secret{
+	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "test",
 			OwnerReferences: ownerRefs,
@@ -64,7 +66,10 @@ func TestPatchConflicts(t *testing.T) {
 	}
 
 	// Create the object we're going to conflict on
-	clientSet.CoreV1().Secrets(ns.Name).Create(context.TODO(), secret, metav1.CreateOptions{})
+	_, err := clientSet.CoreV1().Secrets(ns.Name).Create(context.TODO(), secret, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	client := clientSet.CoreV1().RESTClient()
 
 	successes := int32(0)
@@ -132,4 +137,75 @@ func findOwnerRefByUID(ownerRefs []metav1.OwnerReference, uid types.UID) bool {
 		}
 	}
 	return false
+}
+
+// Shows that a strategic merge patch with a nested patch which is merged
+// with an empty slice is handled property
+// https://github.com/kubernetes/kubernetes/issues/117470
+func TestNestedStrategicMergePatchWithEmpty(t *testing.T) {
+	clientSet, _, tearDownFn := setup(t)
+	defer tearDownFn()
+
+	url := "https://foo.com"
+	se := admissionregistrationv1.SideEffectClassNone
+
+	_, err := clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Create(
+			context.TODO(),
+			&admissionregistrationv1.ValidatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "base-validation",
+				},
+				Webhooks: []admissionregistrationv1.ValidatingWebhook{
+					{
+						AdmissionReviewVersions: []string{"v1"},
+						ClientConfig:            admissionregistrationv1.WebhookClientConfig{URL: &url},
+						Name:                    "foo.bar.com",
+						SideEffects:             &se,
+					},
+				},
+			},
+			metav1.CreateOptions{
+				FieldManager:    "kubectl-client-side-apply",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
+
+	_, err = clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Patch(
+			context.TODO(),
+			"base-validation",
+			types.StrategicMergePatchType,
+			[]byte(`
+	{
+		"webhooks": null
+	}
+`),
+			metav1.PatchOptions{
+				FieldManager:    "kubectl-edit",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
+
+	// Try to apply a patch to the webhook
+	_, err = clientSet.
+		AdmissionregistrationV1().
+		ValidatingWebhookConfigurations().
+		Patch(
+			context.TODO(),
+			"base-validation",
+			types.StrategicMergePatchType,
+			[]byte(`{"$setElementOrder/webhooks":[{"name":"new.foo.com"}],"metadata":{"annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{\"apiVersion\":\"admissionregistration.k8s.io/v1\",\"kind\":\"ValidatingWebhookConfiguration\",\"metadata\":{\"annotations\":{},\"name\":\"base-validation\"},\"webhooks\":[{\"admissionReviewVersions\":[\"v1\"],\"clientConfig\":{\"url\":\"https://foo.com\"},\"name\":\"new.foo.com\",\"sideEffects\":\"None\"}]}\n"}},"webhooks":[{"admissionReviewVersions":["v1"],"clientConfig":{"url":"https://foo.com"},"name":"new.foo.com","sideEffects":"None"},{"$patch":"delete","name":"foo.bar.com"}]}`),
+			metav1.PatchOptions{
+				FieldManager:    "kubectl-client-side-apply",
+				FieldValidation: metav1.FieldValidationStrict,
+			},
+		)
+	require.NoError(t, err)
 }
