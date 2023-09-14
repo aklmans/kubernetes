@@ -34,9 +34,9 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 )
 
-var _ = SIGDescribe("Topology Manager Metrics [Serial][NodeFeature:TopologyManager]", func() {
+var _ = SIGDescribe("Topology Manager Metrics [Serial] [Feature:TopologyManager]", func() {
 	f := framework.NewDefaultFramework("topologymanager-metrics")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 
 	ginkgo.Context("when querying /metrics", func() {
 		var oldCfg *kubeletconfig.KubeletConfiguration
@@ -174,5 +174,6 @@ func checkMetricValueGreaterThan(value interface{}) types.GomegaMatcher {
 		"Metric":    gstruct.Ignore(),
 		"Value":     gomega.BeNumerically(">", value),
 		"Timestamp": gstruct.Ignore(),
+		"Histogram": gstruct.Ignore(),
 	}))
 }

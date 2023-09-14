@@ -19,10 +19,15 @@ package testing
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
@@ -34,6 +39,7 @@ import (
 	"k8s.io/apiserver/pkg/storage"
 	"k8s.io/apiserver/pkg/storage/value"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
+	"k8s.io/utils/pointer"
 )
 
 func RunTestWatch(ctx context.Context, t *testing.T, store storage.Interface) {
@@ -189,8 +195,10 @@ func testWatch(ctx context.Context, t *testing.T, store storage.Interface, recur
 }
 
 // RunTestWatchFromZero tests that
-// - watch from 0 should sync up and grab the object added before
-// - watch from 0 is able to return events for objects whose previous version has been compacted
+//   - watch from 0 should sync up and grab the object added before
+//   - For testing with etcd, watch from 0 is able to return events for objects
+//     whose previous version has been compacted. If testing with cacher, we
+//     expect compaction to be nil.
 func RunTestWatchFromZero(ctx context.Context, t *testing.T, store storage.Interface, compaction Compaction) {
 	key, storedObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
 
@@ -199,7 +207,6 @@ func RunTestWatchFromZero(ctx context.Context, t *testing.T, store storage.Inter
 		t.Fatalf("Watch failed: %v", err)
 	}
 	testCheckResult(t, watch.Added, w, storedObj)
-	w.Stop()
 
 	// Update
 	out := &example.Pod{}
@@ -211,21 +218,31 @@ func RunTestWatchFromZero(ctx context.Context, t *testing.T, store storage.Inter
 		t.Fatalf("GuaranteedUpdate failed: %v", err)
 	}
 
+	// Check that we receive a modified watch event. This check also
+	// indirectly ensures that the cache is synced. This is important
+	// when testing with the Cacher since we may have to allow for slow
+	// processing by allowing updates to propagate to the watch cache.
+	// This allows for that.
+	testCheckResult(t, watch.Modified, w, out)
+	w.Stop()
+
 	// Make sure when we watch from 0 we receive an ADDED event
 	w, err = store.Watch(ctx, key, storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
+
 	testCheckResult(t, watch.Added, w, out)
 	w.Stop()
 
+	// Compact previous versions
 	if compaction == nil {
 		t.Skip("compaction callback not provided")
 	}
 
 	// Update again
-	out = &example.Pod{}
-	err = store.GuaranteedUpdate(ctx, key, out, true, nil, storage.SimpleUpdate(
+	newOut := &example.Pod{}
+	err = store.GuaranteedUpdate(ctx, key, newOut, true, nil, storage.SimpleUpdate(
 		func(runtime.Object) (runtime.Object, error) {
 			return &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}}, nil
 		}), nil)
@@ -234,14 +251,37 @@ func RunTestWatchFromZero(ctx context.Context, t *testing.T, store storage.Inter
 	}
 
 	// Compact previous versions
-	compaction(ctx, t, out.ResourceVersion)
+	compaction(ctx, t, newOut.ResourceVersion)
 
 	// Make sure we can still watch from 0 and receive an ADDED event
 	w, err = store.Watch(ctx, key, storage.ListOptions{ResourceVersion: "0", Predicate: storage.Everything})
+	defer w.Stop()
 	if err != nil {
 		t.Fatalf("Watch failed: %v", err)
 	}
-	testCheckResult(t, watch.Added, w, out)
+	testCheckResult(t, watch.Added, w, newOut)
+
+	// Make sure we can't watch from older resource versions anymoer and get a "Gone" error.
+	tooOldWatcher, err := store.Watch(ctx, key, storage.ListOptions{ResourceVersion: out.ResourceVersion, Predicate: storage.Everything})
+	if err != nil {
+		t.Fatalf("Watch failed: %v", err)
+	}
+	defer tooOldWatcher.Stop()
+	expiredError := errors.NewResourceExpired("").ErrStatus
+	// TODO(wojtek-t): It seems that etcd is currently returning a different error,
+	// being an Internal error of "etcd event received with PrevKv=nil".
+	// We temporary allow both but we should unify here.
+	internalError := metav1.Status{
+		Status: metav1.StatusFailure,
+		Code:   http.StatusInternalServerError,
+		Reason: metav1.StatusReasonInternalError,
+	}
+	testCheckResultFunc(t, watch.Error, tooOldWatcher, func(obj runtime.Object) error {
+		if !apiequality.Semantic.DeepDerivative(&expiredError, obj) && !apiequality.Semantic.DeepDerivative(&internalError, obj) {
+			t.Errorf("expected: %#v; got %#v", &expiredError, obj)
+		}
+		return nil
+	})
 }
 
 func RunTestDeleteTriggerWatch(ctx context.Context, t *testing.T, store storage.Interface) {
@@ -1002,7 +1042,7 @@ func RunTestNamespaceScopedWatch(ctx context.Context, t *testing.T, store storag
 // TODO(#109831): ProgressNotify feature is effectively implementing the same
 //
 //	functionality, so we should refactor this functionality to share the same input.
-func RunTestWatchDispatchBookmarkEvents(ctx context.Context, t *testing.T, store storage.Interface) {
+func RunTestWatchDispatchBookmarkEvents(ctx context.Context, t *testing.T, store storage.Interface, expectedWatchBookmarks bool) {
 	key, storedObj := testPropagateStore(ctx, t, store, &example.Pod{ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "test-ns"}})
 	startRV := storedObj.ResourceVersion
 
@@ -1021,7 +1061,7 @@ func RunTestWatchDispatchBookmarkEvents(ctx context.Context, t *testing.T, store
 		{
 			name:                "allowWatchBookmarks=true",
 			timeout:             3 * time.Second,
-			expected:            true,
+			expected:            expectedWatchBookmarks,
 			allowWatchBookmarks: true,
 		},
 	}
@@ -1165,6 +1205,18 @@ func RunTestOptionalWatchBookmarksWithCorrectResourceVersion(ctx context.Context
 			lastObservedResourceVersion = rv
 		}
 	}
+}
+
+// RunSendInitialEventsBackwardCompatibility test backward compatibility
+// when SendInitialEvents option is set against various implementations.
+// Backward compatibility is defined as RV = "" || RV = "O" and AllowWatchBookmark is set to false.
+// In that case we expect a watch request to be established.
+func RunSendInitialEventsBackwardCompatibility(ctx context.Context, t *testing.T, store storage.Interface) {
+	opts := storage.ListOptions{Predicate: storage.Everything}
+	opts.SendInitialEvents = pointer.Bool(true)
+	w, err := store.Watch(ctx, "/pods", opts)
+	require.NoError(t, err)
+	w.Stop()
 }
 
 type testWatchStruct struct {

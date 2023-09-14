@@ -32,6 +32,7 @@ import (
 	admissionapi "k8s.io/pod-security-admission/api"
 
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 const (
@@ -43,7 +44,7 @@ const (
 
 var _ = SIGDescribe("TTLAfterFinished", func() {
 	f := framework.NewDefaultFramework("ttlafterfinished")
-	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelBaseline
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 
 	ginkgo.It("job should be deleted once it finishes after TTL seconds", func(ctx context.Context) {
 		testFinishedJob(ctx, f)
@@ -102,7 +103,7 @@ func testFinishedJob(ctx context.Context, f *framework.Framework) {
 	}
 
 	deleteAtUTC := job.ObjectMeta.DeletionTimestamp.UTC()
-	framework.ExpectNotEqual(deleteAtUTC, nil)
+	gomega.Expect(deleteAtUTC).NotTo(gomega.BeNil())
 
 	expireAtUTC := finishTimeUTC.Add(time.Duration(ttl) * time.Second)
 	if deleteAtUTC.Before(expireAtUTC) {
