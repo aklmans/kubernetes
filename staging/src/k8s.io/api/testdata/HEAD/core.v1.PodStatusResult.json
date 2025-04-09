@@ -44,10 +44,12 @@
     ]
   },
   "status": {
+    "observedGeneration": 17,
     "phase": "phaseValue",
     "conditions": [
       {
         "type": "typeValue",
+        "observedGeneration": 7,
         "status": "statusValue",
         "lastProbeTime": "2003-01-01T01:01:01Z",
         "lastTransitionTime": "2004-01-01T01:01:01Z",
@@ -128,10 +130,40 @@
           },
           "claims": [
             {
-              "name": "nameValue"
+              "name": "nameValue",
+              "request": "requestValue"
             }
           ]
-        }
+        },
+        "volumeMounts": [
+          {
+            "name": "nameValue",
+            "mountPath": "mountPathValue",
+            "readOnly": true,
+            "recursiveReadOnly": "recursiveReadOnlyValue"
+          }
+        ],
+        "user": {
+          "linux": {
+            "uid": 1,
+            "gid": 2,
+            "supplementalGroups": [
+              3
+            ]
+          }
+        },
+        "allocatedResourcesStatus": [
+          {
+            "name": "nameValue",
+            "resources": [
+              {
+                "resourceID": "resourceIDValue",
+                "health": "healthValue"
+              }
+            ]
+          }
+        ],
+        "stopSignal": "stopSignalValue"
       }
     ],
     "containerStatuses": [
@@ -191,10 +223,40 @@
           },
           "claims": [
             {
-              "name": "nameValue"
+              "name": "nameValue",
+              "request": "requestValue"
             }
           ]
-        }
+        },
+        "volumeMounts": [
+          {
+            "name": "nameValue",
+            "mountPath": "mountPathValue",
+            "readOnly": true,
+            "recursiveReadOnly": "recursiveReadOnlyValue"
+          }
+        ],
+        "user": {
+          "linux": {
+            "uid": 1,
+            "gid": 2,
+            "supplementalGroups": [
+              3
+            ]
+          }
+        },
+        "allocatedResourcesStatus": [
+          {
+            "name": "nameValue",
+            "resources": [
+              {
+                "resourceID": "resourceIDValue",
+                "health": "healthValue"
+              }
+            ]
+          }
+        ],
+        "stopSignal": "stopSignalValue"
       }
     ],
     "qosClass": "qosClassValue",
@@ -255,10 +317,40 @@
           },
           "claims": [
             {
-              "name": "nameValue"
+              "name": "nameValue",
+              "request": "requestValue"
             }
           ]
-        }
+        },
+        "volumeMounts": [
+          {
+            "name": "nameValue",
+            "mountPath": "mountPathValue",
+            "readOnly": true,
+            "recursiveReadOnly": "recursiveReadOnlyValue"
+          }
+        ],
+        "user": {
+          "linux": {
+            "uid": 1,
+            "gid": 2,
+            "supplementalGroups": [
+              3
+            ]
+          }
+        },
+        "allocatedResourcesStatus": [
+          {
+            "name": "nameValue",
+            "resources": [
+              {
+                "resourceID": "resourceIDValue",
+                "health": "healthValue"
+              }
+            ]
+          }
+        ],
+        "stopSignal": "stopSignalValue"
       }
     ],
     "resize": "resizeValue",

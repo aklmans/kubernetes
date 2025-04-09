@@ -65,13 +65,13 @@ func UniversalUnmarshal(buffer []byte) (runtime.Object, error) {
 	return obj, nil
 }
 
-// SplitYAMLDocuments reads the YAML bytes per-document, unmarshals the TypeMeta information from each document
+// SplitConfigDocuments reads the YAML/JSON bytes per-document, unmarshals the TypeMeta information from each document
 // and returns a map between the GroupVersionKind of the document and the document bytes
-func SplitYAMLDocuments(yamlBytes []byte) (kubeadmapi.DocumentMap, error) {
+func SplitConfigDocuments(documentBytes []byte) (kubeadmapi.DocumentMap, error) {
 	gvkmap := kubeadmapi.DocumentMap{}
 	knownKinds := map[string]bool{}
 	errs := []error{}
-	buf := bytes.NewBuffer(yamlBytes)
+	buf := bytes.NewBuffer(documentBytes)
 	reader := utilyaml.NewYAMLReader(bufio.NewReader(buf))
 	for {
 		// Read one YAML document at a time, until io.EOF is returned
@@ -111,7 +111,7 @@ func SplitYAMLDocuments(yamlBytes []byte) (kubeadmapi.DocumentMap, error) {
 
 // GroupVersionKindsFromBytes parses the bytes and returns a gvk slice
 func GroupVersionKindsFromBytes(b []byte) ([]schema.GroupVersionKind, error) {
-	gvkmap, err := SplitYAMLDocuments(b)
+	gvkmap, err := SplitConfigDocuments(b)
 	if err != nil {
 		return nil, err
 	}
@@ -150,4 +150,9 @@ func GroupVersionKindsHasJoinConfiguration(gvks ...schema.GroupVersionKind) bool
 // GroupVersionKindsHasResetConfiguration returns whether the following gvk slice contains a ResetConfiguration object
 func GroupVersionKindsHasResetConfiguration(gvks ...schema.GroupVersionKind) bool {
 	return GroupVersionKindsHasKind(gvks, constants.ResetConfigurationKind)
+}
+
+// GroupVersionKindsHasUpgradeConfiguration returns whether the following gvk slice contains a UpgradeConfiguration object
+func GroupVersionKindsHasUpgradeConfiguration(gvks ...schema.GroupVersionKind) bool {
+	return GroupVersionKindsHasKind(gvks, constants.UpgradeConfigurationKind)
 }

@@ -31,6 +31,7 @@ func getDefaultPlugins() *v1.Plugins {
 	plugins := &v1.Plugins{
 		MultiPoint: v1.PluginSet{
 			Enabled: []v1.Plugin{
+				{Name: names.SchedulingGates},
 				{Name: names.PrioritySort},
 				{Name: names.NodeUnschedulable},
 				{Name: names.NodeName},
@@ -39,10 +40,7 @@ func getDefaultPlugins() *v1.Plugins {
 				{Name: names.NodePorts},
 				{Name: names.NodeResourcesFit, Weight: ptr.To[int32](1)},
 				{Name: names.VolumeRestrictions},
-				{Name: names.EBSLimits},
-				{Name: names.GCEPDLimits},
 				{Name: names.NodeVolumeLimits},
-				{Name: names.AzureDiskLimits},
 				{Name: names.VolumeBinding},
 				{Name: names.VolumeZone},
 				{Name: names.PodTopologySpread, Weight: ptr.To[int32](2)},
@@ -60,9 +58,6 @@ func getDefaultPlugins() *v1.Plugins {
 }
 
 func applyFeatureGates(config *v1.Plugins) {
-	if utilfeature.DefaultFeatureGate.Enabled(features.PodSchedulingReadiness) {
-		config.MultiPoint.Enabled = append(config.MultiPoint.Enabled, v1.Plugin{Name: names.SchedulingGates})
-	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
 		// This plugin should come before DefaultPreemption because if
 		// there is a problem with a Pod and PostFilter gets called to
@@ -113,7 +108,7 @@ func mergePluginSet(logger klog.Logger, defaultPluginSet, customPluginSet v1.Plu
 	disabledPlugins := sets.New[string]()
 	enabledCustomPlugins := make(map[string]pluginIndex)
 	// replacedPluginIndex is a set of index of plugins, which have replaced the default plugins.
-	replacedPluginIndex := sets.NewInt()
+	replacedPluginIndex := sets.New[int]()
 	var disabled []v1.Plugin
 	for _, disabledPlugin := range customPluginSet.Disabled {
 		// if the user is manually disabling any (or all, with "*") default plugins for an extension point,

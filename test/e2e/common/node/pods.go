@@ -64,7 +64,7 @@ import (
 const (
 	buildBackOffDuration = time.Minute
 	syncLoopFrequency    = 10 * time.Second
-	maxBackOffTolerance  = time.Duration(1.3 * float64(kubelet.MaxContainerBackOff))
+	maxBackOffTolerance  = time.Duration(1.3 * float64(kubelet.MaxCrashLoopBackOff))
 	podRetryPeriod       = 1 * time.Second
 )
 
@@ -202,7 +202,7 @@ var _ = SIGDescribe("Pods", func() {
 		Testname: Pods, assigned hostip
 		Description: Create a Pod. Pod status MUST return successfully and contains a valid IP address.
 	*/
-	framework.ConformanceIt("should get a host IP [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should get a host IP", f.WithNodeConformance(), func(ctx context.Context) {
 		name := "pod-hostip-" + string(uuid.NewUUID())
 		testHostIP(ctx, podClient, e2epod.MustMixinRestrictedPodSecurity(&v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
@@ -224,7 +224,7 @@ var _ = SIGDescribe("Pods", func() {
 		Testname: Pods, lifecycle
 		Description: A Pod is created with a unique label. Pod MUST be accessible when queried using the label selector upon creation. Add a watch, check if the Pod is running. Pod then deleted, The pod deletion timestamp is observed. The watch MUST return the pod deleted event. Query with the original selector for the Pod MUST return empty list.
 	*/
-	framework.ConformanceIt("should be submitted and removed [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should be submitted and removed", f.WithNodeConformance(), func(ctx context.Context) {
 		ginkgo.By("creating the pod")
 		name := "pod-submit-remove-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
@@ -307,7 +307,7 @@ var _ = SIGDescribe("Pods", func() {
 		ginkgo.By("verifying pod deletion was observed")
 		deleted := false
 		var lastPod *v1.Pod
-		timer := time.After(e2epod.DefaultPodDeletionTimeout)
+		timer := time.After(f.Timeouts.PodDelete)
 		for !deleted {
 			select {
 			case event := <-w.ResultChan():
@@ -342,7 +342,7 @@ var _ = SIGDescribe("Pods", func() {
 		Testname: Pods, update
 		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. Update the pod to change the value of the Label. Query for the Pod with the new value for the label MUST be successful.
 	*/
-	framework.ConformanceIt("should be updated [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should be updated", f.WithNodeConformance(), func(ctx context.Context) {
 		ginkgo.By("creating the pod")
 		name := "pod-update-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
@@ -396,7 +396,7 @@ var _ = SIGDescribe("Pods", func() {
 		Testname: Pods, ActiveDeadlineSeconds
 		Description: Create a Pod with a unique label. Query for the Pod with the label as selector MUST be successful. The Pod is updated with ActiveDeadlineSeconds set on the Pod spec. Pod MUST terminate of the specified time elapses.
 	*/
-	framework.ConformanceIt("should allow activeDeadlineSeconds to be updated [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should allow activeDeadlineSeconds to be updated", f.WithNodeConformance(), func(ctx context.Context) {
 		ginkgo.By("creating the pod")
 		name := "pod-update-activedeadlineseconds-" + string(uuid.NewUUID())
 		value := strconv.Itoa(time.Now().Nanosecond())
@@ -442,7 +442,7 @@ var _ = SIGDescribe("Pods", func() {
 		Testname: Pods, service environment variables
 		Description: Create a server Pod listening on port 9376. A Service called fooservice is created for the server Pod listening on port 8765 targeting port 8080. If a new Pod is created in the cluster then the Pod MUST have the fooservice environment variables available from this new Pod. The new create Pod MUST have environment variables such as FOOSERVICE_SERVICE_HOST, FOOSERVICE_SERVICE_PORT, FOOSERVICE_PORT, FOOSERVICE_PORT_8765_TCP_PORT, FOOSERVICE_PORT_8765_TCP_PROTO, FOOSERVICE_PORT_8765_TCP and FOOSERVICE_PORT_8765_TCP_ADDR that are populated with proper values.
 	*/
-	framework.ConformanceIt("should contain environment variables for services [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should contain environment variables for services", f.WithNodeConformance(), func(ctx context.Context) {
 		// Make a pod that will be a service.
 		// This pod serves its hostname via HTTP.
 		serverName := "server-envvars-" + string(uuid.NewUUID())
@@ -455,7 +455,7 @@ var _ = SIGDescribe("Pods", func() {
 				Containers: []v1.Container{
 					{
 						Name:  "srv",
-						Image: framework.ServeHostnameImage,
+						Image: imageutils.GetE2EImage(imageutils.Agnhost),
 						Ports: []v1.ContainerPort{{ContainerPort: 9376}},
 					},
 				},
@@ -534,7 +534,7 @@ var _ = SIGDescribe("Pods", func() {
 		Description: A Pod is created. Websocket is created to retrieve exec command output from this pod.
 		Message retrieved form Websocket MUST match with expected exec command output.
 	*/
-	framework.ConformanceIt("should support remote command execution over websockets [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support remote command execution over websockets", f.WithNodeConformance(), func(ctx context.Context) {
 		config, err := framework.LoadConfig()
 		framework.ExpectNoError(err, "unable to get base config")
 
@@ -616,7 +616,7 @@ var _ = SIGDescribe("Pods", func() {
 		Description: A Pod is created. Websocket is created to retrieve log of a container from this pod.
 		Message retrieved form Websocket MUST match with container's output.
 	*/
-	framework.ConformanceIt("should support retrieving logs from the container over websockets [NodeConformance]", func(ctx context.Context) {
+	framework.ConformanceIt("should support retrieving logs from the container over websockets", f.WithNodeConformance(), func(ctx context.Context) {
 		config, err := framework.LoadConfig()
 		framework.ExpectNoError(err, "unable to get base config")
 
@@ -638,7 +638,11 @@ var _ = SIGDescribe("Pods", func() {
 		})
 
 		ginkgo.By("submitting the pod to kubernetes")
-		podClient.CreateSync(ctx, pod)
+		pod = podClient.CreateSync(ctx, pod)
+
+		ginkgo.By("waiting for the container to be running")
+		err = e2epod.WaitForContainerRunning(ctx, f.ClientSet, pod.Namespace, pod.Name, pod.Spec.Containers[0].Name, framework.PodStartShortTimeout)
+		framework.ExpectNoError(err, "failed to wait for container to be running")
 
 		req := f.ClientSet.CoreV1().RESTClient().Get().
 			Namespace(f.Namespace.Name).
@@ -674,7 +678,7 @@ var _ = SIGDescribe("Pods", func() {
 	})
 
 	// Slow (~7 mins)
-	ginkgo.It("should have their auto-restart back-off timer reset on image update [Slow][NodeConformance]", func(ctx context.Context) {
+	f.It("should have their auto-restart back-off timer reset on image update", f.WithSlow(), f.WithNodeConformance(), func(ctx context.Context) {
 		podName := "pod-back-off-image"
 		containerName := "back-off"
 		pod := e2epod.MustMixinRestrictedPodSecurity(&v1.Pod{
@@ -715,7 +719,7 @@ var _ = SIGDescribe("Pods", func() {
 	})
 
 	// Slow by design (~27 mins) issue #19027
-	ginkgo.It("should cap back-off at MaxContainerBackOff [Slow][NodeConformance]", func(ctx context.Context) {
+	f.It("should cap back-off at MaxContainerBackOff", f.WithSlow(), f.WithNodeConformance(), func(ctx context.Context) {
 		podName := "back-off-cap"
 		containerName := "back-off-cap"
 		pod := e2epod.MustMixinRestrictedPodSecurity(&v1.Pod{
@@ -735,7 +739,7 @@ var _ = SIGDescribe("Pods", func() {
 		})
 
 		podClient.CreateSync(ctx, pod)
-		time.Sleep(2 * kubelet.MaxContainerBackOff) // it takes slightly more than 2*x to get to a back-off of x
+		time.Sleep(2 * kubelet.MaxCrashLoopBackOff) // it takes slightly more than 2*x to get to a back-off of x
 
 		// wait for a delay == capped delay of MaxContainerBackOff
 		ginkgo.By("getting restart delay when capped")
@@ -749,13 +753,13 @@ var _ = SIGDescribe("Pods", func() {
 				framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
 			}
 
-			if delay1 < kubelet.MaxContainerBackOff {
+			if delay1 < kubelet.MaxCrashLoopBackOff {
 				continue
 			}
 		}
 
-		if (delay1 < kubelet.MaxContainerBackOff) || (delay1 > maxBackOffTolerance) {
-			framework.Failf("expected %s back-off got=%s in delay1", kubelet.MaxContainerBackOff, delay1)
+		if (delay1 < kubelet.MaxCrashLoopBackOff) || (delay1 > maxBackOffTolerance) {
+			framework.Failf("expected %s back-off got=%s in delay1", kubelet.MaxCrashLoopBackOff, delay1)
 		}
 
 		ginkgo.By("getting restart delay after a capped delay")
@@ -764,12 +768,12 @@ var _ = SIGDescribe("Pods", func() {
 			framework.Failf("timed out waiting for container restart in pod=%s/%s", podName, containerName)
 		}
 
-		if delay2 < kubelet.MaxContainerBackOff || delay2 > maxBackOffTolerance { // syncloop cumulative drift
-			framework.Failf("expected %s back-off got=%s on delay2", kubelet.MaxContainerBackOff, delay2)
+		if delay2 < kubelet.MaxCrashLoopBackOff || delay2 > maxBackOffTolerance { // syncloop cumulative drift
+			framework.Failf("expected %s back-off got=%s on delay2", kubelet.MaxCrashLoopBackOff, delay2)
 		}
 	})
 
-	ginkgo.It("should support pod readiness gates [NodeConformance]", func(ctx context.Context) {
+	f.It("should support pod readiness gates", f.WithNodeConformance(), func(ctx context.Context) {
 		podName := "pod-ready"
 		readinessGate1 := "k8s.io/test-condition1"
 		readinessGate2 := "k8s.io/test-condition2"
@@ -851,7 +855,7 @@ var _ = SIGDescribe("Pods", func() {
 		ginkgo.By("Create set of pods")
 		// create a set of pods in test namespace
 		for _, podTestName := range podTestNames {
-			_, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx,
+			_ = podClient.Create(ctx,
 				e2epod.MustMixinRestrictedPodSecurity(&v1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: podTestName,
@@ -866,14 +870,13 @@ var _ = SIGDescribe("Pods", func() {
 							Name:  "token-test",
 						}},
 						RestartPolicy: v1.RestartPolicyNever,
-					}}), metav1.CreateOptions{})
-			framework.ExpectNoError(err, "failed to create pod")
+					}}))
 			framework.Logf("created %v", podTestName)
 		}
 
 		// wait as required for all 3 pods to be running
 		ginkgo.By("waiting for all 3 pods to be running")
-		err := e2epod.WaitForPodsRunningReady(ctx, f.ClientSet, f.Namespace.Name, 3, 0, f.Timeouts.PodStart)
+		err := e2epod.WaitForPodsRunningReady(ctx, f.ClientSet, f.Namespace.Name, 3, f.Timeouts.PodStart)
 		framework.ExpectNoError(err, "3 pods not found running.")
 
 		// delete Collection of pods with a label in the current namespace
@@ -883,7 +886,7 @@ var _ = SIGDescribe("Pods", func() {
 
 		// wait for all pods to be deleted
 		ginkgo.By("waiting for all pods to be deleted")
-		err = wait.PollImmediateWithContext(ctx, podRetryPeriod, f.Timeouts.PodDelete, checkPodListQuantity(f, "type=Testing", 0))
+		err = wait.PollUntilContextTimeout(ctx, podRetryPeriod, f.Timeouts.PodDelete, true, checkPodListQuantity(f, "type=Testing", 0))
 		framework.ExpectNoError(err, "found a pod(s)")
 	})
 
@@ -929,8 +932,7 @@ var _ = SIGDescribe("Pods", func() {
 			},
 		})
 		ginkgo.By("creating a Pod with a static label")
-		_, err = f.ClientSet.CoreV1().Pods(testNamespaceName).Create(ctx, testPod, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create Pod %v in namespace %v", testPod.ObjectMeta.Name, testNamespaceName)
+		_ = podClient.Create(ctx, testPod)
 
 		ginkgo.By("watching for Pod to be ready")
 		ctxUntil, cancel := context.WithTimeout(ctx, f.Timeouts.PodStart)
@@ -1042,7 +1044,7 @@ var _ = SIGDescribe("Pods", func() {
 		framework.ExpectNoError(err, "failed to delete Pod by collection")
 
 		ginkgo.By("watching for the Pod to be deleted")
-		ctxUntil, cancel = context.WithTimeout(ctx, 1*time.Minute)
+		ctxUntil, cancel = context.WithTimeout(ctx, f.Timeouts.PodDelete)
 		defer cancel()
 		_, err = watchtools.Until(ctxUntil, preDeleteResourceVersion, w, func(event watch.Event) (bool, error) {
 			switch event.Type {
@@ -1082,8 +1084,6 @@ var _ = SIGDescribe("Pods", func() {
 		the fields MUST equal the new values.
 	*/
 	framework.ConformanceIt("should patch a pod status", func(ctx context.Context) {
-		ns := f.Namespace.Name
-		podClient := f.ClientSet.CoreV1().Pods(ns)
 		podName := "pod-" + utilrand.String(5)
 		label := map[string]string{"e2e": podName}
 
@@ -1103,8 +1103,7 @@ var _ = SIGDescribe("Pods", func() {
 				},
 			},
 		})
-		pod, err := podClient.Create(ctx, testPod, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create Pod %v in namespace %v", testPod.ObjectMeta.Name, ns)
+		pod := podClient.Create(ctx, testPod)
 		framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod), "Pod didn't start within time out period")
 
 		ginkgo.By("patching /status")

@@ -20,16 +20,16 @@ limitations under the License.
 package ipvs
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"errors"
 	libipvs "github.com/moby/ipvs"
-
 	"golang.org/x/sys/unix"
+
 	"k8s.io/klog/v2"
 )
 

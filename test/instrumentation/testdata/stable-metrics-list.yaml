@@ -1,3 +1,15 @@
+- name: compilation_duration_seconds
+  subsystem: cel
+  namespace: apiserver
+  help: CEL compilation time in seconds.
+  type: Histogram
+  stabilityLevel: BETA
+- name: evaluation_duration_seconds
+  subsystem: cel
+  namespace: apiserver
+  help: CEL evaluation time in seconds.
+  type: Histogram
+  stabilityLevel: BETA
 - name: current_executing_requests
   subsystem: flowcontrol
   namespace: apiserver
@@ -80,6 +92,49 @@
   - 10
   - 15
   - 30
+- name: check_duration_seconds
+  subsystem: validating_admission_policy
+  namespace: apiserver
+  help: Validation admission latency for individual validation expressions in seconds,
+    labeled by policy and further including binding and enforcement action taken.
+  type: Histogram
+  stabilityLevel: BETA
+  labels:
+  - enforcement_action
+  - error_type
+  - policy
+  - policy_binding
+  buckets:
+  - 5e-07
+  - 0.001
+  - 0.01
+  - 0.1
+  - 1
+- name: check_total
+  subsystem: validating_admission_policy
+  namespace: apiserver
+  help: Validation admission policy check total, labeled by policy and further identified
+    by binding and enforcement action taken.
+  type: Counter
+  stabilityLevel: BETA
+  labels:
+  - enforcement_action
+  - error_type
+  - policy
+  - policy_binding
+- name: declarative_validation_mismatch_total
+  subsystem: validation
+  namespace: apiserver
+  help: Number of times declarative validation results differed from handwritten validation
+    results for core types.
+  type: Counter
+  stabilityLevel: BETA
+- name: declarative_validation_panic_total
+  subsystem: validation
+  namespace: apiserver
+  help: Number of times declarative validation has panicked during validation.
+  type: Counter
+  stabilityLevel: BETA
 - name: disabled_metrics_total
   help: The count of disabled metrics.
   type: Counter
@@ -96,23 +151,6 @@
   labels:
   - name
   - stage
-- name: healthcheck
-  namespace: kubernetes
-  help: This metric records the result of a single healthcheck.
-  type: Gauge
-  stabilityLevel: BETA
-  labels:
-  - name
-  - type
-- name: healthchecks_total
-  namespace: kubernetes
-  help: This metric records the results of all healthcheck.
-  type: Counter
-  stabilityLevel: BETA
-  labels:
-  - name
-  - status
-  - type
 - name: registered_metrics_total
   help: The count of registered metrics broken by stability level and deprecation
     version.
@@ -124,7 +162,7 @@
 - name: pod_scheduling_sli_duration_seconds
   subsystem: scheduler
   help: E2e latency for a pod being scheduled, from the time the pod enters the scheduling
-    queue an d might involve multiple scheduling attempts.
+    queue and might involve multiple scheduling attempts.
   type: Histogram
   stabilityLevel: BETA
   labels:
@@ -326,6 +364,12 @@
   stabilityLevel: STABLE
   labels:
   - resource
+- name: apiserver_storage_size_bytes
+  help: Size of the storage database file physically allocated in bytes.
+  type: Custom
+  stabilityLevel: STABLE
+  labels:
+  - storage_cluster_id
 - name: container_cpu_usage_seconds_total
   help: Cumulative cpu time consumed by the container in core-seconds
   type: Custom
@@ -446,6 +490,23 @@
   - priority
   - resource
   - unit
+- name: healthcheck
+  namespace: kubernetes
+  help: This metric records the result of a single healthcheck.
+  type: Gauge
+  stabilityLevel: STABLE
+  labels:
+  - name
+  - type
+- name: healthchecks_total
+  namespace: kubernetes
+  help: This metric records the results of all healthcheck.
+  type: Counter
+  stabilityLevel: STABLE
+  labels:
+  - name
+  - status
+  - type
 - name: evictions_total
   subsystem: node_collector
   help: Number of Node evictions that happened since current instance of NodeController
@@ -524,36 +585,6 @@
   - 4
   - 8
   - 16
-- name: pod_scheduling_duration_seconds
-  subsystem: scheduler
-  help: E2e latency for a pod being scheduled which may include multiple scheduling
-    attempts.
-  type: Histogram
-  deprecatedVersion: 1.28.0
-  stabilityLevel: STABLE
-  labels:
-  - attempts
-  buckets:
-  - 0.01
-  - 0.02
-  - 0.04
-  - 0.08
-  - 0.16
-  - 0.32
-  - 0.64
-  - 1.28
-  - 2.56
-  - 5.12
-  - 10.24
-  - 20.48
-  - 40.96
-  - 81.92
-  - 163.84
-  - 327.68
-  - 655.36
-  - 1310.72
-  - 2621.44
-  - 5242.88
 - name: preemption_attempts_total
   subsystem: scheduler
   help: Total preemption attempts in the cluster till now

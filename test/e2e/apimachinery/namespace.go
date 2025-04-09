@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"k8s.io/kubernetes/pkg/features"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	imageutils "k8s.io/kubernetes/test/utils/image"
@@ -231,7 +233,7 @@ func ensureServicesAreRemovedWhenNamespaceIsDeleted(ctx context.Context, f *fram
 // that each have a variable amount of content in the associated Namespace.
 // When run in [Serial] this test appears to delete Namespace objects at a
 // rate of approximately 1 per second.
-var _ = SIGDescribe("Namespaces [Serial]", func() {
+var _ = SIGDescribe("Namespaces", framework.WithSerial(), func() {
 
 	f := framework.NewDefaultFramework("namespaces")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
@@ -259,7 +261,7 @@ var _ = SIGDescribe("Namespaces [Serial]", func() {
 	})
 
 	// On hold until etcd3; see #7372
-	ginkgo.It("should always delete fast (ALL of 100 namespaces in 150 seconds) [Feature:ComprehensiveNamespaceDraining]", func(ctx context.Context) {
+	f.It("should always delete fast (ALL of 100 namespaces in 150 seconds)", feature.ComprehensiveNamespaceDraining, func(ctx context.Context) {
 		extinguish(ctx, f, 100, 0, 150)
 	})
 
@@ -473,4 +475,125 @@ func unstructuredToNamespace(obj *unstructured.Unstructured) (*v1.Namespace, err
 	err = runtime.DecodeInto(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), json, ns)
 
 	return ns, err
+}
+
+var _ = SIGDescribe("OrderedNamespaceDeletion", func() {
+	f := framework.NewDefaultFramework("namespacedeletion")
+	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
+
+	f.It("namespace deletion should delete pod first", feature.OrderedNamespaceDeletion, framework.WithFeatureGate(features.OrderedNamespaceDeletion), func(ctx context.Context) {
+		ensurePodsAreRemovedFirstInOrderedNamespaceDeletion(ctx, f)
+	})
+})
+
+func ensurePodsAreRemovedFirstInOrderedNamespaceDeletion(ctx context.Context, f *framework.Framework) {
+	ginkgo.By("Creating a test namespace")
+	namespaceName := "nsdeletetest"
+	namespace, err := f.CreateNamespace(ctx, namespaceName, nil)
+	framework.ExpectNoError(err, "failed to create namespace: %s", namespaceName)
+	nsName := namespace.Name
+
+	ginkgo.By("Waiting for a default service account to be provisioned in namespace")
+	err = framework.WaitForDefaultServiceAccountInNamespace(ctx, f.ClientSet, nsName)
+	framework.ExpectNoError(err, "failure while waiting for a default service account to be provisioned in namespace: %s", nsName)
+
+	ginkgo.By("Creating a pod with finalizer in the namespace")
+	podName := "test-pod"
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName,
+			Finalizers: []string{
+				"e2e.example.com/finalizer",
+			},
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:  "nginx",
+					Image: imageutils.GetPauseImageName(),
+				},
+			},
+		},
+	}
+	pod, err = f.ClientSet.CoreV1().Pods(nsName).Create(ctx, pod, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create pod %s in namespace: %s", podName, nsName)
+
+	ginkgo.By("Waiting for the pod to have running status")
+	framework.ExpectNoError(e2epod.WaitForPodRunningInNamespace(ctx, f.ClientSet, pod))
+
+	configMapName := "test-configmap"
+	ginkgo.By(fmt.Sprintf("Creating a configmap %q in namespace %q", configMapName, nsName))
+	configMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: nsName,
+		},
+		Data: map[string]string{
+			"key": "value",
+		},
+	}
+	_, err = f.ClientSet.CoreV1().ConfigMaps(nsName).Create(ctx, configMap, metav1.CreateOptions{})
+	framework.ExpectNoError(err, "failed to create configmap %q in namespace %q", configMapName, nsName)
+
+	ginkgo.By("Deleting the namespace")
+	err = f.ClientSet.CoreV1().Namespaces().Delete(ctx, nsName, metav1.DeleteOptions{})
+	framework.ExpectNoError(err, "failed to delete namespace: %s", nsName)
+	// wait 10 seconds to allow the namespace controller to process
+	time.Sleep(10 * time.Second)
+	ginkgo.By("the pod should be deleted before processing deletion for other resources")
+	framework.ExpectNoError(wait.PollUntilContextTimeout(ctx, 2*time.Second, 60*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			_, err = f.ClientSet.CoreV1().ConfigMaps(nsName).Get(ctx, configMapName, metav1.GetOptions{})
+			framework.ExpectNoError(err, "configmap %q should still exist in namespace %q", configMapName, nsName)
+			// the pod should exist and has a deletionTimestamp set
+			pod, err = f.ClientSet.CoreV1().Pods(nsName).Get(ctx, pod.Name, metav1.GetOptions{})
+			framework.ExpectNoError(err, "failed to get pod %q in namespace %q", pod.Name, nsName)
+			if pod.DeletionTimestamp == nil {
+				framework.Logf("Pod %q in namespace %q does not yet have a metadata.deletionTimestamp set, retrying...", pod.Name, nsName)
+				return false, nil
+			}
+			ns, err := f.ClientSet.CoreV1().Namespaces().Get(ctx, nsName, metav1.GetOptions{})
+			if err != nil && apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("namespace %s was deleted unexpectedly", nsName)
+			}
+			ginkgo.By("Read namespace status")
+			nsResource := v1.SchemeGroupVersion.WithResource("namespaces")
+			unstruct, err := f.DynamicClient.Resource(nsResource).Get(ctx, ns.Name, metav1.GetOptions{}, "status")
+			framework.ExpectNoError(err, "failed to fetch NamespaceStatus %s", ns)
+			nsStatus, err := unstructuredToNamespace(unstruct)
+			framework.ExpectNoError(err, "Getting the status of the namespace %s", ns)
+			gomega.Expect(nsStatus.Status.Phase).To(gomega.Equal(v1.NamespaceTerminating), "The phase returned was %v", nsStatus.Status.Phase)
+			hasContextFailure := false
+			for _, cond := range nsStatus.Status.Conditions {
+				if cond.Type == v1.NamespaceDeletionContentFailure {
+					hasContextFailure = true
+				}
+			}
+			if !hasContextFailure {
+				framework.Logf("Namespace %q does not yet have a NamespaceDeletionContentFailure condition, retrying...", nsName)
+				return false, nil
+			}
+			return true, nil
+		}))
+
+	ginkgo.By(fmt.Sprintf("Removing finalizer from pod %q in namespace %q", podName, nsName))
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		pod, err = f.ClientSet.CoreV1().Pods(nsName).Get(ctx, podName, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to get pod %q in namespace %q", pod.Name, nsName)
+		pod.Finalizers = []string{}
+		_, err = f.ClientSet.CoreV1().Pods(nsName).Update(ctx, pod, metav1.UpdateOptions{})
+		return err
+	})
+	framework.ExpectNoError(err, "failed to update pod %q and remove finalizer in namespace %q", podName, nsName)
+
+	ginkgo.By("Waiting for the namespace to be removed.")
+	maxWaitSeconds := int64(60) + *pod.Spec.TerminationGracePeriodSeconds
+	framework.ExpectNoError(wait.PollUntilContextTimeout(ctx, 1*time.Second, time.Duration(maxWaitSeconds)*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			_, err = f.ClientSet.CoreV1().Namespaces().Get(ctx, namespace.Name, metav1.GetOptions{})
+			if err != nil && apierrors.IsNotFound(err) {
+				return true, nil
+			}
+			return false, nil
+		}))
 }

@@ -27,7 +27,6 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -37,11 +36,11 @@ import (
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	clientset "k8s.io/client-go/kubernetes"
 	storageutil "k8s.io/kubernetes/pkg/apis/storage/util"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2eauth "k8s.io/kubernetes/test/e2e/framework/auth"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	"k8s.io/kubernetes/test/e2e/framework/providers/gce"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	"k8s.io/kubernetes/test/e2e/storage/testsuites"
@@ -53,23 +52,6 @@ const (
 	// Plugin name of the external provisioner
 	externalPluginName = "example.com/nfs"
 )
-
-func checkGCEPD(volume *v1.PersistentVolume, volumeType string) error {
-	cloud, err := gce.GetGCECloud()
-	if err != nil {
-		return err
-	}
-	diskName := volume.Spec.GCEPersistentDisk.PDName
-	disk, err := cloud.GetDiskByNameUnknownZone(diskName)
-	if err != nil {
-		return err
-	}
-
-	if !strings.HasSuffix(disk.Type, volumeType) {
-		return fmt.Errorf("unexpected disk type %q, expected suffix %q", disk.Type, volumeType)
-	}
-	return nil
-}
 
 var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 	f := framework.NewDefaultFramework("volume-provisioning")
@@ -86,7 +68,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 		timeouts = f.Timeouts
 	})
 
-	ginkgo.Describe("DynamicProvisioner [Slow] [Feature:StorageProvider]", func() {
+	f.Describe("DynamicProvisioner", framework.WithSlow(), feature.StorageProvider, func() {
 		ginkgo.It("should provision storage with different parameters", func(ctx context.Context) {
 
 			// This test checks that dynamic provisioning can provision a volume
@@ -95,7 +77,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 				// GCE/GKE
 				{
 					Name:           "SSD PD on GCE/GKE",
-					CloudProviders: []string{"gce", "gke"},
+					CloudProviders: []string{"gce"},
 					Timeouts:       f.Timeouts,
 					Provisioner:    "kubernetes.io/gce-pd",
 					Parameters: map[string]string{
@@ -107,14 +89,11 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 					PvCheck: func(ctx context.Context, claim *v1.PersistentVolumeClaim) {
 						volume := testsuites.PVWriteReadSingleNodeCheck(ctx, c, f.Timeouts, claim, e2epod.NodeSelection{})
 						gomega.Expect(volume).NotTo(gomega.BeNil(), "get bound PV")
-
-						err := checkGCEPD(volume, "pd-ssd")
-						framework.ExpectNoError(err, "checkGCEPD pd-ssd")
 					},
 				},
 				{
-					Name:           "HDD PD on GCE/GKE",
-					CloudProviders: []string{"gce", "gke"},
+					Name:           "HDD PD on GCE",
+					CloudProviders: []string{"gce"},
 					Timeouts:       f.Timeouts,
 					Provisioner:    "kubernetes.io/gce-pd",
 					Parameters: map[string]string{
@@ -125,9 +104,6 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 					PvCheck: func(ctx context.Context, claim *v1.PersistentVolumeClaim) {
 						volume := testsuites.PVWriteReadSingleNodeCheck(ctx, c, f.Timeouts, claim, e2epod.NodeSelection{})
 						gomega.Expect(volume).NotTo(gomega.BeNil(), "get bound PV")
-
-						err := checkGCEPD(volume, "pd-standard")
-						framework.ExpectNoError(err, "checkGCEPD pd-standard")
 					},
 				},
 				// AWS
@@ -275,7 +251,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 				}
 
 				if zone, ok := test.Parameters["zone"]; ok {
-					framework.ExpectNotEqual(len(zone), 0, "expect at least one zone")
+					gomega.Expect(zone).ToNot(gomega.BeEmpty(), "expect at least one zone")
 				}
 
 				ginkgo.By("Testing " + test.Name)
@@ -297,12 +273,12 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 		})
 
 		ginkgo.It("should provision storage with non-default reclaim policy Retain", func(ctx context.Context) {
-			e2eskipper.SkipUnlessProviderIs("gce", "gke")
+			e2eskipper.SkipUnlessProviderIs("gce")
 
 			test := testsuites.StorageClassTest{
 				Client:         c,
-				Name:           "HDD PD on GCE/GKE",
-				CloudProviders: []string{"gce", "gke"},
+				Name:           "HDD PD on GCE",
+				CloudProviders: []string{"gce"},
 				Provisioner:    "kubernetes.io/gce-pd",
 				Timeouts:       f.Timeouts,
 				Parameters: map[string]string{
@@ -313,9 +289,6 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 				PvCheck: func(ctx context.Context, claim *v1.PersistentVolumeClaim) {
 					volume := testsuites.PVWriteReadSingleNodeCheck(ctx, c, f.Timeouts, claim, e2epod.NodeSelection{})
 					gomega.Expect(volume).NotTo(gomega.BeNil(), "get bound PV")
-
-					err := checkGCEPD(volume, "pd-standard")
-					framework.ExpectNoError(err, "checkGCEPD")
 				},
 			}
 			test.Class = newStorageClass(test, ns, "reclaimpolicy")
@@ -349,7 +322,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 			// not being deleted.
 			// NOTE:  Polls until no PVs are detected, times out at 5 minutes.
 
-			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "gke", "vsphere", "azure")
+			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "vsphere", "azure")
 
 			const raceAttempts int = 100
 			var residualPVs []*v1.PersistentVolume
@@ -395,7 +368,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 			// volume and changes the reclaim policy to Delete.
 			// PV controller should delete the PV even though the underlying volume
 			// is already deleted.
-			e2eskipper.SkipUnlessProviderIs("gce", "gke", "aws")
+			e2eskipper.SkipUnlessProviderIs("gce", "aws")
 			ginkgo.By("creating PD")
 			diskName, err := e2epv.CreatePDWithRetry(ctx)
 			framework.ExpectNoError(err)
@@ -427,7 +400,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 						VolumeID: diskName,
 					},
 				}
-			case "gce", "gke":
+			case "gce":
 				pv.Spec.PersistentVolumeSource = v1.PersistentVolumeSource{
 					GCEPersistentDisk: &v1.GCEPersistentDiskVolumeSource{
 						PDName: diskName,
@@ -459,7 +432,7 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 	})
 
 	ginkgo.Describe("DynamicProvisioner External", func() {
-		ginkgo.It("should let an external dynamic provisioner create and delete persistent volumes [Slow]", func(ctx context.Context) {
+		f.It("should let an external dynamic provisioner create and delete persistent volumes", f.WithSlow(), func(ctx context.Context) {
 			// external dynamic provisioner pods need additional permissions provided by the
 			// persistent-volume-provisioner clusterrole and a leader-locking role
 			serviceAccountName := "default"
@@ -523,8 +496,8 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 	})
 
 	ginkgo.Describe("DynamicProvisioner Default", func() {
-		ginkgo.It("should create and delete default persistent volumes [Slow]", func(ctx context.Context) {
-			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "gke", "vsphere", "azure")
+		f.It("should create and delete default persistent volumes", f.WithSlow(), func(ctx context.Context) {
+			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "vsphere", "azure")
 			e2epv.SkipIfNoDefaultStorageClass(ctx, c)
 
 			ginkgo.By("creating a claim with no annotation")
@@ -547,8 +520,8 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 		})
 
 		// Modifying the default storage class can be disruptive to other tests that depend on it
-		ginkgo.It("should be disabled by changing the default annotation [Serial] [Disruptive]", func(ctx context.Context) {
-			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "gke", "vsphere", "azure")
+		f.It("should be disabled by changing the default annotation", f.WithSerial(), f.WithDisruptive(), func(ctx context.Context) {
+			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "vsphere", "azure")
 			e2epv.SkipIfNoDefaultStorageClass(ctx, c)
 
 			scName, scErr := e2epv.GetDefaultStorageClassName(ctx, c)
@@ -576,16 +549,16 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 
 			// The claim should timeout phase:Pending
 			err = e2epv.WaitForPersistentVolumeClaimPhase(ctx, v1.ClaimBound, c, ns, claim.Name, 2*time.Second, framework.ClaimProvisionShortTimeout)
-			framework.ExpectError(err)
-			framework.Logf(err.Error())
+			gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("not all in phase Bound")))
+			framework.Logf("%s", err.Error())
 			claim, err = c.CoreV1().PersistentVolumeClaims(ns).Get(ctx, claim.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 			gomega.Expect(claim.Status.Phase).To(gomega.Equal(v1.ClaimPending))
 		})
 
 		// Modifying the default storage class can be disruptive to other tests that depend on it
-		ginkgo.It("should be disabled by removing the default annotation [Serial] [Disruptive]", func(ctx context.Context) {
-			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "gke", "vsphere", "azure")
+		f.It("should be disabled by removing the default annotation", f.WithSerial(), f.WithDisruptive(), func(ctx context.Context) {
+			e2eskipper.SkipUnlessProviderIs("openstack", "gce", "aws", "vsphere", "azure")
 			e2epv.SkipIfNoDefaultStorageClass(ctx, c)
 
 			scName, scErr := e2epv.GetDefaultStorageClassName(ctx, c)
@@ -615,8 +588,8 @@ var _ = utils.SIGDescribe("Dynamic Provisioning", func() {
 
 			// The claim should timeout phase:Pending
 			err = e2epv.WaitForPersistentVolumeClaimPhase(ctx, v1.ClaimBound, c, ns, claim.Name, 2*time.Second, framework.ClaimProvisionShortTimeout)
-			framework.ExpectError(err)
-			framework.Logf(err.Error())
+			gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("not all in phase Bound")))
+			framework.Logf("%s", err.Error())
 			claim, err = c.CoreV1().PersistentVolumeClaims(ns).Get(ctx, claim.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 			gomega.Expect(claim.Status.Phase).To(gomega.Equal(v1.ClaimPending))
@@ -720,80 +693,6 @@ func updateDefaultStorageClass(ctx context.Context, c clientset.Interface, scNam
 	verifyDefaultStorageClass(ctx, c, scName, expectedDefault)
 }
 
-func getDefaultPluginName() string {
-	switch {
-	case framework.ProviderIs("gke"), framework.ProviderIs("gce"):
-		return "kubernetes.io/gce-pd"
-	case framework.ProviderIs("aws"):
-		return "kubernetes.io/aws-ebs"
-	case framework.ProviderIs("openstack"):
-		return "kubernetes.io/cinder"
-	case framework.ProviderIs("vsphere"):
-		return "kubernetes.io/vsphere-volume"
-	case framework.ProviderIs("azure"):
-		return "kubernetes.io/azure-disk"
-	}
-	return ""
-}
-
-func newStorageClass(t testsuites.StorageClassTest, ns string, prefix string) *storagev1.StorageClass {
-	pluginName := t.Provisioner
-	if pluginName == "" {
-		pluginName = getDefaultPluginName()
-	}
-	if prefix == "" {
-		prefix = "sc"
-	}
-	bindingMode := storagev1.VolumeBindingImmediate
-	if t.DelayBinding {
-		bindingMode = storagev1.VolumeBindingWaitForFirstConsumer
-	}
-	if t.Parameters == nil {
-		t.Parameters = make(map[string]string)
-	}
-
-	if framework.NodeOSDistroIs("windows") {
-		// fstype might be forced from outside, in that case skip setting a default
-		if _, exists := t.Parameters["fstype"]; !exists {
-			t.Parameters["fstype"] = e2epv.GetDefaultFSType()
-			framework.Logf("settings a default fsType=%s in the storage class", t.Parameters["fstype"])
-		}
-	}
-
-	sc := getStorageClass(pluginName, t.Parameters, &bindingMode, t.MountOptions, ns, prefix)
-	if t.AllowVolumeExpansion {
-		sc.AllowVolumeExpansion = &t.AllowVolumeExpansion
-	}
-	return sc
-}
-
-func getStorageClass(
-	provisioner string,
-	parameters map[string]string,
-	bindingMode *storagev1.VolumeBindingMode,
-	mountOptions []string,
-	ns string,
-	prefix string,
-) *storagev1.StorageClass {
-	if bindingMode == nil {
-		defaultBindingMode := storagev1.VolumeBindingImmediate
-		bindingMode = &defaultBindingMode
-	}
-	return &storagev1.StorageClass{
-		TypeMeta: metav1.TypeMeta{
-			Kind: "StorageClass",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			// Name must be unique, so let's base it on namespace name and the prefix (the prefix is test specific)
-			GenerateName: ns + "-" + prefix,
-		},
-		Provisioner:       provisioner,
-		Parameters:        parameters,
-		VolumeBindingMode: bindingMode,
-		MountOptions:      mountOptions,
-	}
-}
-
 // waitForProvisionedVolumesDelete is a polling wrapper to scan all PersistentVolumes for any associated to the test's
 // StorageClass.  Returns either an error and nil values or the remaining PVs and their count.
 func waitForProvisionedVolumesDeleted(ctx context.Context, c clientset.Interface, scName string) ([]*v1.PersistentVolume, error) {
@@ -818,7 +717,7 @@ func waitForProvisionedVolumesDeleted(ctx context.Context, c clientset.Interface
 		return true, nil // No PVs remain
 	})
 	if err != nil {
-		return remainingPVs, fmt.Errorf("Error waiting for PVs to be deleted: %w", err)
+		return remainingPVs, fmt.Errorf("error waiting for PVs to be deleted: %w", err)
 	}
 	return nil, nil
 }

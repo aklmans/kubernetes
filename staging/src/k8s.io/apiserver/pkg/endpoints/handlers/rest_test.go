@@ -27,9 +27,8 @@ import (
 	"testing"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/go-cmp/cmp"
-	fuzz "github.com/google/gofuzz"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -53,6 +52,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
+	"sigs.k8s.io/randfill"
 )
 
 var (
@@ -134,42 +134,42 @@ func TestLimitedReadBody(t *testing.T) {
 			requestBody: strings.NewReader("aaaa"),
 			limit:       5,
 			expectedMetrics: `
-        # HELP apiserver_request_body_sizes [ALPHA] Apiserver request body sizes broken out by size.
-        # TYPE apiserver_request_body_sizes histogram
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="50000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="150000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="250000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="350000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="450000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="550000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="650000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="750000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="850000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="950000"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.15e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.25e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.35e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.45e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.55e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.65e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.75e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.85e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="1.95e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.15e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.25e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.35e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.45e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.55e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.65e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.75e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.85e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="2.95e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="3.05e+06"} 1
-        apiserver_request_body_sizes_bucket{resource="resource.group",verb="create",le="+Inf"} 1
-        apiserver_request_body_sizes_sum{resource="resource.group",verb="create"} 4
-        apiserver_request_body_sizes_count{resource="resource.group",verb="create"} 1
+        # HELP apiserver_request_body_size_bytes [ALPHA] Apiserver request body size in bytes broken out by resource and verb.
+        # TYPE apiserver_request_body_size_bytes histogram
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="50000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="150000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="250000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="350000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="450000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="550000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="650000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="750000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="850000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="950000"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.15e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.25e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.35e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.45e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.55e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.65e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.75e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.85e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="1.95e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.15e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.25e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.35e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.45e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.55e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.65e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.75e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.85e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="2.95e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="3.05e+06"} 1
+        apiserver_request_body_size_bytes_bucket{resource="resource.group",verb="create",le="+Inf"} 1
+        apiserver_request_body_size_bytes_sum{resource="resource.group",verb="create"} 4
+        apiserver_request_body_size_bytes_count{resource="resource.group",verb="create"} 1
 `,
 			expectedErr: false,
 		},
@@ -192,7 +192,7 @@ func TestLimitedReadBody(t *testing.T) {
 				}
 				return
 			}
-			if err = testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(tc.expectedMetrics), "apiserver_request_body_sizes"); err != nil {
+			if err = testutil.GatherAndCompare(legacyregistry.DefaultGatherer, strings.NewReader(tc.expectedMetrics), "apiserver_request_body_size_bytes"); err != nil {
 				t.Errorf("unexpected err: %v", err)
 			}
 		})
@@ -244,6 +244,10 @@ func TestJSONPatch(t *testing.T) {
 			expectedError:     "the server rejected our request due to an error in our request",
 			expectedErrorType: metav1.StatusReasonInvalid,
 		},
+		{
+			name:  "valid-negative-index-patch",
+			patch: `[{"op": "test", "value": "foo", "path": "/metadata/finalizers/-1"}]`,
+		},
 	} {
 		p := &patcher{
 			patchType:  types.JSONPatchType,
@@ -253,6 +257,7 @@ func TestJSONPatch(t *testing.T) {
 		codec := codecs.LegacyCodec(examplev1.SchemeGroupVersion)
 		pod := &examplev1.Pod{}
 		pod.Name = "podA"
+		pod.ObjectMeta.Finalizers = []string{"foo"}
 		versionedJS, err := runtime.Encode(codec, pod)
 		if err != nil {
 			t.Errorf("%s: unexpected error: %v", test.name, err)
@@ -986,11 +991,11 @@ func (alwaysErrorTyper) Recognizes(gvk schema.GroupVersionKind) bool {
 }
 
 func TestUpdateToCreateOptions(t *testing.T) {
-	f := fuzz.New()
+	f := randfill.New()
 	for i := 0; i < 100; i++ {
 		t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 			update := &metav1.UpdateOptions{}
-			f.Fuzz(update)
+			f.Fill(update)
 			create := updateToCreateOptions(update)
 
 			b, err := json.Marshal(create)
@@ -1033,13 +1038,13 @@ func TestPatchToUpdateOptions(t *testing.T) {
 		},
 	}
 
-	f := fuzz.New()
+	f := randfill.New()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for i := 0; i < 100; i++ {
 				t.Run(fmt.Sprintf("Run %d/100", i), func(t *testing.T) {
 					patch := &metav1.PatchOptions{}
-					f.Fuzz(patch)
+					f.Fill(patch)
 					converted := test.converterFn(patch)
 
 					b, err := json.Marshal(converted)

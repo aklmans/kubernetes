@@ -23,8 +23,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
-	flowcontrolv1beta1 "k8s.io/api/flowcontrol/v1beta1"
-	flowcontrolv1beta2 "k8s.io/api/flowcontrol/v1beta2"
+	flowcontrolv1 "k8s.io/api/flowcontrol/v1"
 	flowcontrolv1beta3 "k8s.io/api/flowcontrol/v1beta3"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -799,6 +798,7 @@ func TestPriorityLevelConfigurationValidation(t *testing.T) {
 	testCases := []struct {
 		name                       string
 		priorityLevelConfiguration *flowcontrol.PriorityLevelConfiguration
+		requestGV                  *schema.GroupVersion
 		expectedErrors             field.ErrorList
 	}{{
 		name: "exempt should work",
@@ -1104,10 +1104,37 @@ func TestPriorityLevelConfigurationValidation(t *testing.T) {
 		expectedErrors: field.ErrorList{
 			field.Invalid(field.NewPath("spec").Child("limited").Child("limitResponse").Child("queuing").Child("handSize"), int32(8), "should not be greater than queues (7)"),
 		},
+	}, {
+		name: "the roundtrip annotation is forbidden",
+		priorityLevelConfiguration: &flowcontrol.PriorityLevelConfiguration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "with-forbidden-annotation",
+				Annotations: map[string]string{
+					flowcontrolv1beta3.PriorityLevelPreserveZeroConcurrencySharesKey: "",
+				},
+			},
+			Spec: flowcontrol.PriorityLevelConfigurationSpec{
+				Type: flowcontrol.PriorityLevelEnablementLimited,
+				Limited: &flowcontrol.LimitedPriorityLevelConfiguration{
+					NominalConcurrencyShares: 42,
+					LimitResponse: flowcontrol.LimitResponse{
+						Type: flowcontrol.LimitResponseTypeReject},
+				},
+			},
+		},
+		// the internal object should never have the round trip annotation
+		requestGV: &schema.GroupVersion{},
+		expectedErrors: field.ErrorList{
+			field.Forbidden(field.NewPath("metadata").Child("annotations"), fmt.Sprintf("annotation '%s' is forbidden", flowcontrolv1beta3.PriorityLevelPreserveZeroConcurrencySharesKey)),
+		},
 	}}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			errs := ValidatePriorityLevelConfiguration(testCase.priorityLevelConfiguration, flowcontrolv1beta3.SchemeGroupVersion)
+			gv := flowcontrolv1beta3.SchemeGroupVersion
+			if testCase.requestGV != nil {
+				gv = *testCase.requestGV
+			}
+			errs := ValidatePriorityLevelConfiguration(testCase.priorityLevelConfiguration, gv, PriorityLevelValidationOptions{})
 			if !assert.ElementsMatch(t, testCase.expectedErrors, errs) {
 				t.Logf("mismatch: %v", cmp.Diff(testCase.expectedErrors, errs))
 			}
@@ -1267,9 +1294,9 @@ func TestValidateNonResourceURLPath(t *testing.T) {
 }
 
 func TestValidateLimitedPriorityLevelConfiguration(t *testing.T) {
-	errExpectedFn := func(fieldName string) field.ErrorList {
+	errExpectedFn := func(fieldName string, v int32, msg string) field.ErrorList {
 		return field.ErrorList{
-			field.Invalid(field.NewPath("spec").Child("limited").Child(fieldName), int32(0), "must be positive"),
+			field.Invalid(field.NewPath("spec").Child("limited").Child(fieldName), int32(v), msg),
 		}
 	}
 
@@ -1278,32 +1305,28 @@ func TestValidateLimitedPriorityLevelConfiguration(t *testing.T) {
 		concurrencyShares int32
 		errExpected       field.ErrorList
 	}{{
-		requestVersion:    flowcontrolv1beta1.SchemeGroupVersion,
-		concurrencyShares: 0,
-		errExpected:       errExpectedFn("assuredConcurrencyShares"),
-	}, {
-		requestVersion:    flowcontrolv1beta2.SchemeGroupVersion,
-		concurrencyShares: 0,
-		errExpected:       errExpectedFn("assuredConcurrencyShares"),
-	}, {
 		requestVersion:    flowcontrolv1beta3.SchemeGroupVersion,
 		concurrencyShares: 0,
-		errExpected:       errExpectedFn("nominalConcurrencyShares"),
-	}, {
-		// let's simulate a post v1beta3 version, we expect the
-		// error to return the new field introduced in v1beta3.
-		requestVersion:    schema.GroupVersion{Group: flowcontrolv1beta3.GroupName, Version: "v1"},
-		concurrencyShares: 0,
-		errExpected:       errExpectedFn("nominalConcurrencyShares"),
-	}, {
-		// this should never really happen in real life, the request
-		// context should always contain the request {group, version}
-		requestVersion:    schema.GroupVersion{},
-		concurrencyShares: 0,
-		errExpected:       errExpectedFn("nominalConcurrencyShares"),
+		errExpected:       nil,
 	}, {
 		requestVersion:    flowcontrolv1beta3.SchemeGroupVersion,
-		concurrencyShares: 100,
+		concurrencyShares: -1,
+		errExpected:       errExpectedFn("nominalConcurrencyShares", -1, "must be a non-negative integer"),
+	}, {
+		requestVersion:    flowcontrolv1beta3.SchemeGroupVersion,
+		concurrencyShares: 1,
+		errExpected:       nil,
+	}, {
+		requestVersion:    flowcontrolv1.SchemeGroupVersion,
+		concurrencyShares: 0,
+		errExpected:       nil,
+	}, {
+		requestVersion:    flowcontrolv1.SchemeGroupVersion,
+		concurrencyShares: -1,
+		errExpected:       errExpectedFn("nominalConcurrencyShares", -1, "must be a non-negative integer"),
+	}, {
+		requestVersion:    flowcontrolv1.SchemeGroupVersion,
+		concurrencyShares: 1,
 		errExpected:       nil,
 	}}
 
@@ -1317,7 +1340,7 @@ func TestValidateLimitedPriorityLevelConfiguration(t *testing.T) {
 			}
 			specPath := field.NewPath("spec").Child("limited")
 
-			errGot := ValidateLimitedPriorityLevelConfiguration(configuration, test.requestVersion, specPath)
+			errGot := ValidateLimitedPriorityLevelConfiguration(configuration, test.requestVersion, specPath, PriorityLevelValidationOptions{})
 			if !cmp.Equal(test.errExpected, errGot) {
 				t.Errorf("Expected error: %v, diff: %s", test.errExpected, cmp.Diff(test.errExpected, errGot))
 			}
@@ -1395,7 +1418,7 @@ func TestValidateLimitedPriorityLevelConfigurationWithBorrowing(t *testing.T) {
 			}
 			specPath := field.NewPath("spec").Child("limited")
 
-			errGot := ValidateLimitedPriorityLevelConfiguration(configuration, flowcontrolv1beta3.SchemeGroupVersion, specPath)
+			errGot := ValidateLimitedPriorityLevelConfiguration(configuration, flowcontrolv1.SchemeGroupVersion, specPath, PriorityLevelValidationOptions{})
 			if !cmp.Equal(test.errExpected, errGot) {
 				t.Errorf("Expected error: %v, diff: %s", test.errExpected, cmp.Diff(test.errExpected, errGot))
 			}

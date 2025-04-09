@@ -71,7 +71,7 @@ func TestPostInvalidObjectMeta(t *testing.T) {
 	if status, ok := err.(errors.APIStatus); !ok {
 		t.Fatalf("expected APIStatus error, but got: %#v", err)
 	} else if !errors.IsBadRequest(err) {
-		t.Fatalf("expected BadRequst error, but got: %v", errors.ReasonForError(err))
+		t.Fatalf("expected BadRequest error, but got: %v", errors.ReasonForError(err))
 	} else if !strings.Contains(status.Status().Message, "cannot be handled") {
 		t.Fatalf("expected 'cannot be handled' error message, got: %v", status.Status().Message)
 	}
@@ -133,7 +133,7 @@ func TestInvalidObjectMetaInStorage(t *testing.T) {
 	}
 
 	RESTOptionsGetter := serveroptions.NewCRDRESTOptionsGetter(*options.RecommendedOptions.Etcd, nil, nil)
-	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: noxuDefinition.Spec.Group, Resource: noxuDefinition.Spec.Names.Plural})
+	restOptions, err := RESTOptionsGetter.GetRESTOptions(schema.GroupResource{Group: noxuDefinition.Spec.Group, Resource: noxuDefinition.Spec.Names.Plural}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

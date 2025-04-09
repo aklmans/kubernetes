@@ -28,7 +28,10 @@ source "${KUBE_ROOT}/hack/lib/init.sh"
 
 kube::util::require-jq
 kube::golang::setup_env
+kube::etcd::install
 
+# We need to call `make` here because that includes all of the compile and link
+# flags that we use for a production build, which we need for this script.
 make -C "${KUBE_ROOT}" WHAT=cmd/kube-apiserver
 
 function cleanup()
@@ -45,8 +48,6 @@ function cleanup()
 }
 
 trap cleanup EXIT SIGINT
-
-kube::golang::setup_env
 
 TMP_DIR=${TMP_DIR:-$(kube::realpath "$(mktemp -d -t "$(basename "$0").XXXXXX")")}
 ETCD_HOST=${ETCD_HOST:-127.0.0.1}
@@ -71,13 +72,17 @@ fi
 # Start kube-apiserver
 # omit enums from static openapi snapshots used to generate clients until #109177 is resolved
 kube::log::status "Starting kube-apiserver"
-"${KUBE_OUTPUT_HOSTBIN}/kube-apiserver" \
+# KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA ensures that the OpenAPI is updated with all APIs
+# that are intended to be removed at a particular release during alpha. 
+# If a new version tag was just created and you are seeing an unrelated diff when adding
+# a new API, run `KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA=false ./hack/update-openapi-spec.sh`.
+KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA=${KUBE_APISERVER_STRICT_REMOVED_API_HANDLING_IN_ALPHA:-true} kube-apiserver \
   --bind-address="${API_HOST}" \
   --secure-port="${API_PORT}" \
   --etcd-servers="http://${ETCD_HOST}:${ETCD_PORT}" \
   --advertise-address="10.10.10.10" \
   --cert-dir="${TMP_DIR}/certs" \
-  --feature-gates=AllAlpha=true,OpenAPIEnums=false \
+  --feature-gates=AllAlpha=true,AllBeta=true,OpenAPIEnums=false \
   --runtime-config="api/all=true" \
   --token-auth-file="${TMP_DIR}/tokenauth.csv" \
   --authorization-mode=RBAC \
@@ -85,6 +90,7 @@ kube::log::status "Starting kube-apiserver"
   --service-account-lookup="${SERVICE_ACCOUNT_LOOKUP}" \
   --service-account-issuer="https://kubernetes.default.svc" \
   --service-account-signing-key-file="${SERVICE_ACCOUNT_KEY}" \
+  --enable-logs-handler=true \
   --v=2 \
   --service-cluster-ip-range="10.0.0.0/24" >"${API_LOGFILE}" 2>&1 &
 APISERVER_PID=$!
@@ -101,7 +107,7 @@ kube::log::status "Updating aggregated discovery"
 
 rm -fr "${DISCOVERY_ROOT_DIR}"
 mkdir -p "${DISCOVERY_ROOT_DIR}"
-curl -kfsS -H 'Authorization: Bearer dummy_token' -H 'Accept: application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList' "https://${API_HOST}:${API_PORT}/apis" | jq -S . > "${DISCOVERY_ROOT_DIR}/aggregated_v2beta1.json"
+curl -kfsS -H 'Authorization: Bearer dummy_token' -H 'Accept: application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList' "https://${API_HOST}:${API_PORT}/apis" | jq -S . > "${DISCOVERY_ROOT_DIR}/aggregated_v2.json"
 
 kube::log::status "Updating " "${OPENAPI_ROOT_DIR} for OpenAPI v2"
 

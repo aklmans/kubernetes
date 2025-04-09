@@ -30,6 +30,8 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"sigs.k8s.io/yaml"
+
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -38,7 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
-	apiserverconfigv1 "k8s.io/apiserver/pkg/apis/config/v1"
+	apiserverv1 "k8s.io/apiserver/pkg/apis/apiserver/v1"
 	"k8s.io/apiserver/pkg/storage/storagebackend"
 	"k8s.io/apiserver/pkg/storage/value"
 	"k8s.io/client-go/dynamic"
@@ -50,8 +52,8 @@ import (
 	"k8s.io/kubernetes/test/integration"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
+	"k8s.io/kubernetes/test/utils/ktesting"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -72,10 +74,10 @@ const (
 	oldSecretVal = "\xf0\x9f\xa4\x97\xf0\x9f\x90\xbc"
 )
 
-type unSealSecret func(ctx context.Context, cipherText []byte, dataCtx value.Context, config apiserverconfigv1.ProviderConfiguration) ([]byte, error)
+type unSealSecret func(ctx context.Context, cipherText []byte, dataCtx value.Context, config apiserverv1.ProviderConfiguration) ([]byte, error)
 
 type transformTest struct {
-	logger            kubeapiservertesting.Logger
+	ktesting.TContext
 	storageConfig     *storagebackend.Config
 	configDir         string
 	transformerConfig string
@@ -85,26 +87,35 @@ type transformTest struct {
 	secret            *corev1.Secret
 }
 
-func newTransformTest(l kubeapiservertesting.Logger, transformerConfigYAML string, reload bool, configDir string, storageConfig *storagebackend.Config) (*transformTest, error) {
-	if storageConfig == nil {
-		storageConfig = framework.SharedEtcd()
+type transformTestConfig struct {
+	transformerConfigYAML string
+	reload                bool
+	configDir             string
+	storageConfig         *storagebackend.Config
+	runtimeConfig         []string
+}
+
+func newTransformTest(tb testing.TB, config transformTestConfig) (*transformTest, error) {
+	tCtx := ktesting.Init(tb)
+	if config.storageConfig == nil {
+		config.storageConfig = framework.SharedEtcd()
 	}
 	e := transformTest{
-		logger:            l,
-		transformerConfig: transformerConfigYAML,
-		storageConfig:     storageConfig,
+		TContext:          tCtx,
+		transformerConfig: config.transformerConfigYAML,
+		storageConfig:     config.storageConfig,
 	}
 
 	var err error
 	// create config dir with provided config yaml
-	if transformerConfigYAML != "" && configDir == "" {
+	if config.transformerConfigYAML != "" && config.configDir == "" {
 		if e.configDir, err = e.createEncryptionConfig(); err != nil {
 			e.cleanUp()
 			return nil, fmt.Errorf("error while creating KubeAPIServer encryption config: %w", err)
 		}
 	} else {
 		// configDir already exists. api-server must be restarting with existing encryption config
-		e.configDir = configDir
+		e.configDir = config.configDir
 	}
 	configFile := filepath.Join(e.configDir, encryptionConfigFileName)
 	_, err = os.ReadFile(configFile)
@@ -113,7 +124,13 @@ func newTransformTest(l kubeapiservertesting.Logger, transformerConfigYAML strin
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
-	if e.kubeAPIServer, err = kubeapiservertesting.StartTestServer(l, nil, e.getEncryptionOptions(reload), e.storageConfig); err != nil {
+	flags := e.getEncryptionOptions(config.reload)
+	if len(config.runtimeConfig) > 0 {
+		flags = append(flags, "--runtime-config="+strings.Join(config.runtimeConfig, ","))
+	}
+	if e.kubeAPIServer, err = kubeapiservertesting.StartTestServer(
+		tb, nil,
+		flags, e.storageConfig); err != nil {
 		e.cleanUp()
 		return nil, fmt.Errorf("failed to start KubeAPI server: %w", err)
 	}
@@ -129,13 +146,13 @@ func newTransformTest(l kubeapiservertesting.Logger, transformerConfigYAML strin
 		return nil, err
 	}
 
-	if transformerConfigYAML != "" && reload {
+	if config.transformerConfigYAML != "" && config.reload {
 		// when reloading is enabled, this healthz endpoint is always present
-		mustBeHealthy(l, "/kms-providers", "ok", e.kubeAPIServer.ClientConfig)
-		mustNotHaveLivez(l, "/kms-providers", "404 page not found", e.kubeAPIServer.ClientConfig)
+		mustBeHealthy(tCtx, "/kms-providers", "ok", e.kubeAPIServer.ClientConfig)
+		mustNotHaveLivez(tCtx, "/kms-providers", "404 page not found", e.kubeAPIServer.ClientConfig)
 
 		// excluding healthz endpoints even if they do not exist should work
-		mustBeHealthy(l, "", `warn: some health checks cannot be excluded: no matches for "kms-provider-0","kms-provider-1","kms-provider-2","kms-provider-3"`,
+		mustBeHealthy(tCtx, "", `warn: some health checks cannot be excluded: no matches for "kms-provider-0","kms-provider-1","kms-provider-2","kms-provider-3"`,
 			e.kubeAPIServer.ClientConfig, "kms-provider-0", "kms-provider-1", "kms-provider-2", "kms-provider-3")
 	}
 
@@ -275,7 +292,8 @@ func (e *transformTest) getEncryptionOptions(reload bool) []string {
 		return []string{
 			"--encryption-provider-config", filepath.Join(e.configDir, encryptionConfigFileName),
 			fmt.Sprintf("--encryption-provider-config-automatic-reload=%v", reload),
-			"--disable-admission-plugins", "ServiceAccount"}
+			"--disable-admission-plugins", "ServiceAccount",
+			"--authorization-mode=RBAC"}
 	}
 
 	return nil
@@ -298,8 +316,8 @@ func (e *transformTest) createEncryptionConfig() (
 	return tempDir, nil
 }
 
-func (e *transformTest) getEncryptionConfig() (*apiserverconfigv1.ProviderConfiguration, error) {
-	var config apiserverconfigv1.EncryptionConfiguration
+func (e *transformTest) getEncryptionConfig() (*apiserverv1.ProviderConfiguration, error) {
+	var config apiserverv1.EncryptionConfiguration
 	err := yaml.Unmarshal([]byte(e.transformerConfig), &config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract transformer key: %v", err)
@@ -530,7 +548,7 @@ func (e *transformTest) writeRawRecordToETCD(path string, data []byte) (*clientv
 }
 
 func (e *transformTest) printMetrics() error {
-	e.logger.Logf("Transformation Metrics:")
+	e.Logf("Transformation Metrics:")
 	metrics, err := legacyregistry.DefaultGatherer.Gather()
 	if err != nil {
 		return fmt.Errorf("failed to gather metrics: %s", err)
@@ -538,9 +556,9 @@ func (e *transformTest) printMetrics() error {
 
 	for _, mf := range metrics {
 		if strings.HasPrefix(*mf.Name, metricsPrefix) {
-			e.logger.Logf("%s", *mf.Name)
+			e.Logf("%s", *mf.Name)
 			for _, metric := range mf.GetMetric() {
-				e.logger.Logf("%v", metric)
+				e.Logf("%v", metric)
 			}
 		}
 	}

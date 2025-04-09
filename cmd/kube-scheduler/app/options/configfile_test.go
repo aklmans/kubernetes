@@ -18,9 +18,11 @@ package options
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,7 +34,6 @@ const (
 	apiVersionMissing = "'apiVersion' is missing"
 	apiVersionTooOld  = "no kind \"KubeSchedulerConfiguration\" is registered for" +
 		" version \"kubescheduler.config.k8s.io/v1alpha1\""
-	fileNotFound = "no such file or directory"
 
 	// schedulerConfigMinimalCorrect is the minimal
 	// correct scheduler config
@@ -91,7 +92,7 @@ func TestLoadConfigFromFile(t *testing.T) {
 		{
 			name:           "Empty scheduler config file path",
 			path:           "",
-			expectedErr:    fmt.Errorf(fileNotFound),
+			expectedErr:    syscall.Errno(syscall.ENOENT),
 			expectedConfig: nil,
 		},
 		{
@@ -103,13 +104,13 @@ func TestLoadConfigFromFile(t *testing.T) {
 		{
 			name:           "Scheduler config with decode error",
 			path:           decodeErrConfigFile,
-			expectedErr:    fmt.Errorf(apiVersionMissing),
+			expectedErr:    errors.New(apiVersionMissing),
 			expectedConfig: nil,
 		},
 		{
 			name:           "Scheduler config version too old",
 			path:           versionTooOldConfigFile,
-			expectedErr:    fmt.Errorf(apiVersionTooOld),
+			expectedErr:    errors.New(apiVersionTooOld),
 			expectedConfig: nil,
 		},
 	}

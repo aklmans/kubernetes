@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	machineryutilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/version"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistrytest "k8s.io/apiserver/pkg/registry/generic/testing"
@@ -502,6 +503,62 @@ func TestPatchAllocatedValues(t *testing.T) {
 		update: svctest.MakeService("foo",
 			svctest.SetTypeExternalName,
 			svctest.SetExternalTrafficPolicy(api.ServiceExternalTrafficPolicyLocal)),
+	}, {
+		name: "reset_NodePort",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetNodePorts(0)),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   false,
+	}, {
+		name: "reset_partial_NodePorts",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetPorts(
+				svctest.MakeServicePort("", 93, intstr.FromInt32(76), api.ProtocolTCP),
+				svctest.MakeServicePort("", 94, intstr.FromInt32(76), api.ProtocolTCP),
+			),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(false),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetPorts(
+				svctest.MakeServicePort("", 93, intstr.FromInt32(76), api.ProtocolTCP),
+				svctest.MakeServicePort("", 94, intstr.FromInt32(76), api.ProtocolTCP),
+			),
+			svctest.SetUniqueNodePorts,
+			func(service *api.Service) {
+				service.Spec.Ports[1].NodePort = 0
+			}),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   false,
+	}, {
+		name: "keep_NodePort",
+		before: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(true),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetUniqueNodePorts,
+			svctest.SetHealthCheckNodePort(31234)),
+		update: svctest.MakeService("foo",
+			svctest.SetTypeLoadBalancer,
+			svctest.SetAllocateLoadBalancerNodePorts(true),
+			svctest.SetClusterIPs("10.0.0.93", "2000::76"),
+			svctest.SetNodePorts(0)),
+		expectSameClusterIPs: true,
+		expectSameNodePort:   true,
 	}}
 
 	for _, tc := range testCases {
@@ -532,10 +589,18 @@ func TestPatchAllocatedValues(t *testing.T) {
 			} else if cmp.Equal(beforeIPs, updateIPs) {
 				t.Errorf("expected clusterIPs to not be patched: %q == %q", beforeIPs, updateIPs)
 			}
-			if b, u := tc.before.Spec.Ports[0].NodePort, update.Spec.Ports[0].NodePort; tc.expectSameNodePort && b != u {
-				t.Errorf("expected nodePort to be patched: %d != %d", b, u)
-			} else if !tc.expectSameNodePort && b == u {
-				t.Errorf("expected nodePort to not be patched: %d == %d", b, u)
+
+			bNodePorts, uNodePorts := make([]int32, 0), make([]int32, 0)
+			for _, item := range tc.before.Spec.Ports {
+				bNodePorts = append(bNodePorts, item.NodePort)
+			}
+			for _, item := range update.Spec.Ports {
+				uNodePorts = append(uNodePorts, item.NodePort)
+			}
+			if tc.expectSameNodePort && !reflect.DeepEqual(bNodePorts, uNodePorts) {
+				t.Errorf("expected nodePort to be patched: %v != %v", bNodePorts, uNodePorts)
+			} else if !tc.expectSameNodePort && reflect.DeepEqual(bNodePorts, uNodePorts) {
+				t.Errorf("expected nodePort to not be patched: %v == %v", bNodePorts, uNodePorts)
 			}
 
 			if b, u := tc.before.Spec.HealthCheckNodePort, update.Spec.HealthCheckNodePort; tc.expectSameHCNP && b != u {
@@ -11671,7 +11736,7 @@ func TestServiceRegistryResourceLocation(t *testing.T) {
 			if tc.err == false && err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if tc.err == true && err == nil {
+			if tc.err && err == nil {
 				t.Fatalf("unexpected success")
 			}
 			if !tc.err {
@@ -11933,8 +11998,11 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 			defer storage.Delete(ctx, svc.Name, rest.ValidateAllObjectFunc, &metav1.DeleteOptions{})
 
 			// prepare status
-			if loadbalancerIPModeInUse(tc.statusBeforeUpdate) {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, true)()
+			// Test here is negative, because starting with v1.30 the feature gate is enabled by default, so we should
+			// now disable it to do the proper test
+			if !loadbalancerIPModeInUse(tc.statusBeforeUpdate) {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.31"))
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, false)
 			}
 			oldSvc := obj.(*api.Service).DeepCopy()
 			oldSvc.Status = tc.statusBeforeUpdate
@@ -11943,7 +12011,10 @@ func TestUpdateServiceLoadBalancerStatus(t *testing.T) {
 				t.Errorf("updated status: %s", err)
 			}
 
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, tc.ipModeEnabled)()
+			if !tc.ipModeEnabled {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.31"))
+			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.LoadBalancerIPMode, tc.ipModeEnabled)
 			newSvc := obj.(*api.Service).DeepCopy()
 			newSvc.Status = tc.newStatus
 			obj, _, err = statusStorage.Update(ctx, newSvc.Name, rest.DefaultUpdatedObjectInfo(newSvc), rest.ValidateAllObjectFunc, rest.ValidateAllObjectUpdateFunc, false, &metav1.UpdateOptions{})

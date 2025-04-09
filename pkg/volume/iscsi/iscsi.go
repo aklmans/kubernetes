@@ -90,10 +90,6 @@ func (plugin *iscsiPlugin) SupportsMountOption() bool {
 	return true
 }
 
-func (plugin *iscsiPlugin) SupportsBulkVolumeVerification() bool {
-	return false
-}
-
 func (plugin *iscsiPlugin) SupportsSELinuxContextMount(spec *volume.Spec) (bool, error) {
 	return true, nil
 }
@@ -105,7 +101,7 @@ func (plugin *iscsiPlugin) GetAccessModes() []v1.PersistentVolumeAccessMode {
 	}
 }
 
-func (plugin *iscsiPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod, _ volume.VolumeOptions) (volume.Mounter, error) {
+func (plugin *iscsiPlugin) NewMounter(spec *volume.Spec, pod *v1.Pod) (volume.Mounter, error) {
 	if pod == nil {
 		return nil, fmt.Errorf("nil pod")
 	}
@@ -143,7 +139,7 @@ func (plugin *iscsiPlugin) newMounterInternal(spec *volume.Spec, podUID types.UI
 }
 
 // NewBlockVolumeMapper creates a new volume.BlockVolumeMapper from an API specification.
-func (plugin *iscsiPlugin) NewBlockVolumeMapper(spec *volume.Spec, pod *v1.Pod, _ volume.VolumeOptions) (volume.BlockVolumeMapper, error) {
+func (plugin *iscsiPlugin) NewBlockVolumeMapper(spec *volume.Spec, pod *v1.Pod) (volume.BlockVolumeMapper, error) {
 	// If this is called via GenerateUnmapDeviceFunc(), pod is nil.
 	// Pass empty string as dummy uid since uid isn't used in the case.
 	var uid types.UID
@@ -381,7 +377,7 @@ func (b *iscsiDiskMounter) SetUp(mounterArgs volume.MounterArgs) error {
 
 func (b *iscsiDiskMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
 	// diskSetUp checks mountpoints and prevent repeated calls
-	err := diskSetUp(b.manager, *b, dir, b.mounter, mounterArgs.FsGroup, mounterArgs.FSGroupChangePolicy)
+	err := diskSetUp(b.manager, *b, dir, b.mounter, mounterArgs)
 	if err != nil {
 		klog.Errorf("iscsi: failed to setup")
 	}

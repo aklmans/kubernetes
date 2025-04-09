@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/endpointslice/metrics"
 	"k8s.io/endpointslice/topologycache"
+	"k8s.io/endpointslice/trafficdist"
 	endpointsliceutil "k8s.io/endpointslice/util"
 	"k8s.io/klog/v2"
 )
@@ -50,9 +51,46 @@ type Reconciler struct {
 	// topologyCache tracks the distribution of Nodes and endpoints across zones
 	// to enable TopologyAwareHints.
 	topologyCache *topologycache.TopologyCache
+	// trafficDistributionEnabled determines if trafficDistribution field is to
+	// be considered when reconciling EndpointSlice hints.
+	trafficDistributionEnabled bool
+	// preferSameTrafficDistribution determines if the new (PreferSameZone /
+	// PreferSameNode) trafficDistribution values should be considered when
+	// reconciling EndpointSlice hints.
+	preferSameTrafficDistribution bool
 	// eventRecorder allows Reconciler to record and publish events.
 	eventRecorder  record.EventRecorder
 	controllerName string
+}
+
+type ReconcilerOption func(*Reconciler)
+
+// WithTrafficDistributionEnabled controls whether the Reconciler considers the
+// `trafficDistribution` field while reconciling EndpointSlices.
+func WithTrafficDistributionEnabled(enabled, preferSame bool) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.trafficDistributionEnabled = enabled
+		r.preferSameTrafficDistribution = preferSame
+	}
+}
+
+// validTrafficDistribution determines whether TrafficDistribution is set and valid for
+// this cluster.
+func (r *Reconciler) validTrafficDistribution(trafficDistribution *string) bool {
+	if trafficDistribution == nil || !r.trafficDistributionEnabled {
+		return false
+	}
+	if *trafficDistribution == corev1.ServiceTrafficDistributionPreferClose {
+		return true
+	}
+	if !r.preferSameTrafficDistribution {
+		return false
+	}
+	if *trafficDistribution == corev1.ServiceTrafficDistributionPreferSameZone ||
+		*trafficDistribution == corev1.ServiceTrafficDistributionPreferSameNode {
+		return true
+	}
+	return false
 }
 
 // endpointMeta includes the attributes we group slices on, this type helps with
@@ -261,9 +299,32 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 		Unchanged:   unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete),
 	}
 
+	canUseTrafficDistribution := r.validTrafficDistribution(service.Spec.TrafficDistribution) && !hintsEnabled(service.Annotations)
+
+	// Check if we need to add/remove hints based on the topology annotation.
+	//
+	// This if/else clause can be removed once the annotation has been deprecated.
+	// Ref: https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/4444-service-routing-preference
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
+		// Reaching this point means that we need to configure hints based on the
+		// topology annotation.
 		slicesToCreate, slicesToUpdate, events = r.topologyCache.AddHints(logger, si)
+
 	} else {
+		// Reaching this point means that we will not be configuring hints based on
+		// the topology annotation. We need to do 2 things:
+		//  1. If hints were added previously based on the annotation, we need to
+		//     clear up any locally cached hints from the topologyCache object.
+		//  2. Optionally remove the actual hints from the EndpointSlice if we know
+		//     that the `trafficDistribution` field is also NOT being used. In other
+		//     words, if we know that the `trafficDistribution` field has been
+		//     correctly configured by the customer, we DO NOT remove the hints and
+		//     wait for the trafficDist handlers to correctly configure them. Always
+		//     unconditionally removing hints here (and letting them get readded by
+		//     the trafficDist) adds extra overhead in the form of DeepCopy (done
+		//     within topologyCache.RemoveHints)
+
+		// Check 1.
 		if r.topologyCache != nil {
 			if r.topologyCache.HasPopulatedHints(si.ServiceKey) {
 				logger.Info("TopologyAwareHints annotation has changed, removing hints", "serviceKey", si.ServiceKey, "addressType", si.AddressType)
@@ -275,8 +336,20 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 			}
 			r.topologyCache.RemoveHints(si.ServiceKey, addressType)
 		}
-		slicesToCreate, slicesToUpdate = topologycache.RemoveHintsFromSlices(si)
+
+		// Check 2.
+		if !canUseTrafficDistribution {
+			slicesToCreate, slicesToUpdate = topologycache.RemoveHintsFromSlices(si)
+		}
 	}
+
+	if canUseTrafficDistribution {
+		r.metricsCache.UpdateTrafficDistributionForService(serviceNN, service.Spec.TrafficDistribution)
+		slicesToCreate, slicesToUpdate, _ = trafficdist.ReconcileHints(service.Spec.TrafficDistribution, slicesToCreate, slicesToUpdate, unchangedSlices(existingSlices, slicesToUpdate, slicesToDelete))
+	} else {
+		r.metricsCache.UpdateTrafficDistributionForService(serviceNN, nil)
+	}
+
 	err := r.finalize(service, slicesToCreate, slicesToUpdate, slicesToDelete, triggerTime)
 	if err != nil {
 		errs = append(errs, err)
@@ -288,8 +361,8 @@ func (r *Reconciler) reconcileByAddressType(logger klog.Logger, service *corev1.
 
 }
 
-func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister, maxEndpointsPerSlice int32, endpointSliceTracker *endpointsliceutil.EndpointSliceTracker, topologyCache *topologycache.TopologyCache, eventRecorder record.EventRecorder, controllerName string) *Reconciler {
-	return &Reconciler{
+func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister, maxEndpointsPerSlice int32, endpointSliceTracker *endpointsliceutil.EndpointSliceTracker, topologyCache *topologycache.TopologyCache, eventRecorder record.EventRecorder, controllerName string, options ...ReconcilerOption) *Reconciler {
+	r := &Reconciler{
 		client:               client,
 		nodeLister:           nodeLister,
 		maxEndpointsPerSlice: maxEndpointsPerSlice,
@@ -299,6 +372,10 @@ func NewReconciler(client clientset.Interface, nodeLister corelisters.NodeLister
 		eventRecorder:        eventRecorder,
 		controllerName:       controllerName,
 	}
+	for _, option := range options {
+		option(r)
+	}
+	return r
 }
 
 // placeholderSliceCompare is a conversion func for comparing two placeholder endpoint slices.
@@ -401,9 +478,13 @@ func (r *Reconciler) finalize(
 	if r.topologyCache != nil && hintsEnabled(service.Annotations) {
 		topologyLabel = "Auto"
 	}
+	var trafficDistribution string
+	if r.validTrafficDistribution(service.Spec.TrafficDistribution) && !hintsEnabled(service.Annotations) {
+		trafficDistribution = *service.Spec.TrafficDistribution
+	}
 
 	numSlicesChanged := len(slicesToCreate) + len(slicesToUpdate) + len(slicesToDelete)
-	metrics.EndpointSlicesChangedPerSync.WithLabelValues(topologyLabel).Observe(float64(numSlicesChanged))
+	metrics.EndpointSlicesChangedPerSync.WithLabelValues(topologyLabel, trafficDistribution).Observe(float64(numSlicesChanged))
 
 	return nil
 }

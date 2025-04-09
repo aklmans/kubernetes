@@ -195,7 +195,7 @@ func (f *persistentVolumeClaimNamespaceLister) Get(name string) (*v1.PersistentV
 			return pvc, nil
 		}
 	}
-	return nil, fmt.Errorf("persistentvolumeclaim %q not found", name)
+	return nil, errors.NewNotFound(v1.Resource("persistentvolumeclaims"), name)
 }
 
 func (f persistentVolumeClaimNamespaceLister) List(selector labels.Selector) (ret []*v1.PersistentVolumeClaim, err error) {
@@ -266,7 +266,7 @@ func (n CSINodeLister) Get(name string) (*storagev1.CSINode, error) {
 			return &cn, nil
 		}
 	}
-	return nil, fmt.Errorf("csiNode %q not found", name)
+	return nil, errors.NewNotFound(storagev1.Resource("csinodes"), name)
 }
 
 // List lists all CSINodes in the indexer.
@@ -286,7 +286,7 @@ func (pvs PersistentVolumeLister) Get(pvID string) (*v1.PersistentVolume, error)
 			return &pv, nil
 		}
 	}
-	return nil, fmt.Errorf("unable to find persistent volume: %s", pvID)
+	return nil, errors.NewNotFound(v1.Resource("persistentvolumes"), pvID)
 }
 
 // List lists all PersistentVolumes in the indexer.
@@ -306,15 +306,34 @@ func (classes StorageClassLister) Get(name string) (*storagev1.StorageClass, err
 			return &sc, nil
 		}
 	}
-	return nil, &errors.StatusError{
-		ErrStatus: metav1.Status{
-			Reason:  metav1.StatusReasonNotFound,
-			Message: fmt.Sprintf("unable to find storage class: %s", name),
-		},
-	}
+	return nil, errors.NewNotFound(storagev1.Resource("storageclasses"), name)
 }
 
 // List lists all StorageClass in the indexer.
 func (classes StorageClassLister) List(selector labels.Selector) ([]*storagev1.StorageClass, error) {
 	return nil, fmt.Errorf("not implemented")
+}
+
+// VolumeAttachmentLister declares a []storagev1.VolumeAttachment type for testing.
+type VolumeAttachmentLister []storagev1.VolumeAttachment
+
+var _ storagelisters.VolumeAttachmentLister = VolumeAttachmentLister{}
+
+// List lists all VolumeAttachments in the indexer.
+func (val VolumeAttachmentLister) List(selector labels.Selector) (ret []*storagev1.VolumeAttachment, err error) {
+	var list []*storagev1.VolumeAttachment
+	for i := range val {
+		list = append(list, &val[i])
+	}
+	return list, nil
+}
+
+// Get returns a fake VolumeAttachment object from the fake VolumeAttachments by name.
+func (val VolumeAttachmentLister) Get(name string) (*storagev1.VolumeAttachment, error) {
+	for _, va := range val {
+		if va.Name == name {
+			return &va, nil
+		}
+	}
+	return nil, errors.NewNotFound(storagev1.Resource("volumeattachments"), name)
 }

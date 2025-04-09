@@ -716,7 +716,7 @@ func (r *FakeRuntimeService) CheckpointContainer(_ context.Context, options *run
 	return nil
 }
 
-func (f *FakeRuntimeService) GetContainerEvents(containerEventsCh chan *runtimeapi.ContainerEventResponse) error {
+func (f *FakeRuntimeService) GetContainerEvents(ctx context.Context, containerEventsCh chan *runtimeapi.ContainerEventResponse, connectionEstablishedCallback func(runtimeapi.RuntimeService_GetContainerEventsClient)) error {
 	return nil
 }
 
@@ -793,4 +793,17 @@ func (r *FakeRuntimeService) RuntimeConfig(_ context.Context) (*runtimeapi.Runti
 	}
 
 	return &runtimeapi.RuntimeConfigResponse{Linux: r.FakeLinuxConfiguration}, nil
+}
+
+// UpdatePodSandboxResources returns the container resource in the FakeRuntimeService.
+func (r *FakeRuntimeService) UpdatePodSandboxResources(context.Context, *runtimeapi.UpdatePodSandboxResourcesRequest) (*runtimeapi.UpdatePodSandboxResourcesResponse, error) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.Called = append(r.Called, "UpdatePodSandboxResources")
+	if err := r.popError("UpdatePodSandboxResources"); err != nil {
+		return nil, err
+	}
+
+	return &runtimeapi.UpdatePodSandboxResourcesResponse{}, nil
 }

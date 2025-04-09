@@ -17,17 +17,18 @@ limitations under the License.
 package resourceclaim
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/assert"
 
 	v1 "k8s.io/api/core/v1"
-	resourcev1alpha2 "k8s.io/api/resource/v1alpha2"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,12 +36,11 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-	"k8s.io/client-go/tools/cache"
 	"k8s.io/component-base/metrics/testutil"
-	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
-	ephemeralvolumemetrics "k8s.io/kubernetes/pkg/controller/resourceclaim/metrics"
-	"k8s.io/utils/pointer"
+	"k8s.io/kubernetes/pkg/controller/resourceclaim/metrics"
+	"k8s.io/kubernetes/test/utils/ktesting"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -62,13 +62,15 @@ var (
 	testClaimReserved      = reserveClaim(testClaimAllocated, testPodWithResource)
 	testClaimReservedTwice = reserveClaim(testClaimReserved, otherTestPod)
 
-	generatedTestClaim          = makeGeneratedClaim(podResourceClaimName, testPodName+"-"+podResourceClaimName+"-", testNamespace, className, 1, makeOwnerReference(testPodWithResource, true))
+	generatedTestClaim          = makeGeneratedClaim(podResourceClaimName, testPodName+"-"+podResourceClaimName+"-", testNamespace, className, 1, makeOwnerReference(testPodWithResource, true), nil)
+	generatedTestClaimWithAdmin = makeGeneratedClaim(podResourceClaimName, testPodName+"-"+podResourceClaimName+"-", testNamespace, className, 1, makeOwnerReference(testPodWithResource, true), ptr.To(true))
 	generatedTestClaimAllocated = allocateClaim(generatedTestClaim)
 	generatedTestClaimReserved  = reserveClaim(generatedTestClaimAllocated, testPodWithResource)
 
-	conflictingClaim    = makeClaim(testPodName+"-"+podResourceClaimName, testNamespace, className, nil)
-	otherNamespaceClaim = makeClaim(testPodName+"-"+podResourceClaimName, otherNamespace, className, nil)
-	template            = makeTemplate(templateName, testNamespace, className)
+	conflictingClaim        = makeClaim(testPodName+"-"+podResourceClaimName, testNamespace, className, nil)
+	otherNamespaceClaim     = makeClaim(testPodName+"-"+podResourceClaimName, otherNamespace, className, nil)
+	template                = makeTemplate(templateName, testNamespace, className, nil)
+	templateWithAdminAccess = makeTemplate(templateName, testNamespace, className, ptr.To(true))
 
 	testPodWithNodeName = func() *v1.Pod {
 		pod := testPodWithResource.DeepCopy()
@@ -79,58 +81,58 @@ var (
 		})
 		return pod
 	}()
-
-	podSchedulingContext = resourcev1alpha2.PodSchedulingContext{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testPodName,
-			Namespace: testNamespace,
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion: "v1",
-					Kind:       "Pod",
-					Name:       testPodName,
-					UID:        testPodUID,
-					Controller: pointer.Bool(true),
-				},
-			},
-		},
-		Spec: resourcev1alpha2.PodSchedulingContextSpec{
-			SelectedNode: nodeName,
-		},
-	}
+	adminAccessFeatureOffError = "admin access is requested, but the feature is disabled"
 )
-
-func init() {
-	klog.InitFlags(nil)
-}
 
 func TestSyncHandler(t *testing.T) {
 	tests := []struct {
-		name                          string
-		key                           string
-		claims                        []*resourcev1alpha2.ResourceClaim
-		claimsInCache                 []*resourcev1alpha2.ResourceClaim
-		pods                          []*v1.Pod
-		podsLater                     []*v1.Pod
-		templates                     []*resourcev1alpha2.ResourceClaimTemplate
-		expectedClaims                []resourcev1alpha2.ResourceClaim
-		expectedPodSchedulingContexts []resourcev1alpha2.PodSchedulingContext
-		expectedStatuses              map[string][]v1.PodResourceClaimStatus
-		expectedError                 bool
-		expectedMetrics               expectedMetrics
+		name                   string
+		key                    string
+		adminAccessEnabled     bool
+		prioritizedListEnabled bool
+		claims                 []*resourceapi.ResourceClaim
+		claimsInCache          []*resourceapi.ResourceClaim
+		pods                   []*v1.Pod
+		podsLater              []*v1.Pod
+		templates              []*resourceapi.ResourceClaimTemplate
+		expectedClaims         []resourceapi.ResourceClaim
+		expectedStatuses       map[string][]v1.PodResourceClaimStatus
+		expectedError          string
+		expectedMetrics        expectedMetrics
 	}{
 		{
 			name:           "create",
 			pods:           []*v1.Pod{testPodWithResource},
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
+			templates:      []*resourceapi.ResourceClaimTemplate{template},
 			key:            podKey(testPodWithResource),
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
 				},
 			},
 			expectedMetrics: expectedMetrics{1, 0},
+		},
+		{
+			name:          "create with admin and feature gate off",
+			pods:          []*v1.Pod{testPodWithResource},
+			templates:     []*resourceapi.ResourceClaimTemplate{templateWithAdminAccess},
+			key:           podKey(testPodWithResource),
+			expectedError: adminAccessFeatureOffError,
+		},
+		{
+			name:           "create with admin and feature gate on",
+			pods:           []*v1.Pod{testPodWithResource},
+			templates:      []*resourceapi.ResourceClaimTemplate{templateWithAdminAccess},
+			key:            podKey(testPodWithResource),
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaimWithAdmin},
+			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
+				testPodWithResource.Name: {
+					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaimWithAdmin.Name},
+				},
+			},
+			adminAccessEnabled: true,
+			expectedMetrics:    expectedMetrics{1, 0},
 		},
 		{
 			name: "nop",
@@ -141,10 +143,10 @@ func TestSyncHandler(t *testing.T) {
 				}
 				return pod
 			}()},
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
+			templates:      []*resourceapi.ResourceClaimTemplate{template},
 			key:            podKey(testPodWithResource),
-			claims:         []*resourcev1alpha2.ResourceClaim{generatedTestClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaim},
+			claims:         []*resourceapi.ResourceClaim{generatedTestClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -161,9 +163,9 @@ func TestSyncHandler(t *testing.T) {
 				}
 				return pod
 			}()},
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
+			templates:      []*resourceapi.ResourceClaimTemplate{template},
 			key:            podKey(testPodWithResource),
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -176,14 +178,14 @@ func TestSyncHandler(t *testing.T) {
 			pods:          []*v1.Pod{testPodWithResource},
 			templates:     nil,
 			key:           podKey(testPodWithResource),
-			expectedError: true,
+			expectedError: "resource claim template \"my-template\": resourceclaimtemplate.resource.k8s.io \"my-template\" not found",
 		},
 		{
 			name:           "find-existing-claim-by-label",
 			pods:           []*v1.Pod{testPodWithResource},
 			key:            podKey(testPodWithResource),
-			claims:         []*resourcev1alpha2.ResourceClaim{generatedTestClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaim},
+			claims:         []*resourceapi.ResourceClaim{generatedTestClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -192,23 +194,10 @@ func TestSyncHandler(t *testing.T) {
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
-			name:           "find-existing-claim-by-name",
-			pods:           []*v1.Pod{testPodWithResource},
-			key:            podKey(testPodWithResource),
-			claims:         []*resourcev1alpha2.ResourceClaim{testClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*testClaim},
-			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
-				testPodWithResource.Name: {
-					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &testClaim.Name},
-				},
-			},
-			expectedMetrics: expectedMetrics{0, 0},
-		},
-		{
 			name:          "find-created-claim-in-cache",
 			pods:          []*v1.Pod{testPodWithResource},
 			key:           podKey(testPodWithResource),
-			claimsInCache: []*resourcev1alpha2.ResourceClaim{generatedTestClaim},
+			claimsInCache: []*resourceapi.ResourceClaim{generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -238,10 +227,10 @@ func TestSyncHandler(t *testing.T) {
 		{
 			name:           "create-with-other-claim",
 			pods:           []*v1.Pod{testPodWithResource},
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
+			templates:      []*resourceapi.ResourceClaimTemplate{template},
 			key:            podKey(testPodWithResource),
-			claims:         []*resourcev1alpha2.ResourceClaim{otherNamespaceClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*otherNamespaceClaim, *generatedTestClaim},
+			claims:         []*resourceapi.ResourceClaim{otherNamespaceClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*otherNamespaceClaim, *generatedTestClaim},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithResource.Name: {
 					{Name: testPodWithResource.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -253,101 +242,111 @@ func TestSyncHandler(t *testing.T) {
 			name:           "wrong-claim-owner",
 			pods:           []*v1.Pod{testPodWithResource},
 			key:            podKey(testPodWithResource),
-			claims:         []*resourcev1alpha2.ResourceClaim{conflictingClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*conflictingClaim},
-			expectedError:  true,
+			claims:         []*resourceapi.ResourceClaim{conflictingClaim},
+			expectedClaims: []resourceapi.ResourceClaim{*conflictingClaim},
+			expectedError:  "resource claim template \"my-template\": resourceclaimtemplate.resource.k8s.io \"my-template\" not found",
 		},
 		{
 			name:            "create-conflict",
 			pods:            []*v1.Pod{testPodWithResource},
-			templates:       []*resourcev1alpha2.ResourceClaimTemplate{template},
+			templates:       []*resourceapi.ResourceClaimTemplate{template},
 			key:             podKey(testPodWithResource),
 			expectedMetrics: expectedMetrics{1, 1},
-			expectedError:   true,
+			expectedError:   "create ResourceClaim : Operation cannot be fulfilled on resourceclaims.resource.k8s.io \"fake name\": fake conflict",
 		},
 		{
 			name:            "stay-reserved-seen",
 			pods:            []*v1.Pod{testPodWithResource},
 			key:             claimKey(testClaimReserved),
-			claims:          []*resourcev1alpha2.ResourceClaim{testClaimReserved},
-			expectedClaims:  []resourcev1alpha2.ResourceClaim{*testClaimReserved},
+			claims:          []*resourceapi.ResourceClaim{testClaimReserved},
+			expectedClaims:  []resourceapi.ResourceClaim{*testClaimReserved},
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
 			name:            "stay-reserved-not-seen",
 			podsLater:       []*v1.Pod{testPodWithResource},
 			key:             claimKey(testClaimReserved),
-			claims:          []*resourcev1alpha2.ResourceClaim{testClaimReserved},
-			expectedClaims:  []resourcev1alpha2.ResourceClaim{*testClaimReserved},
+			claims:          []*resourceapi.ResourceClaim{testClaimReserved},
+			expectedClaims:  []resourceapi.ResourceClaim{*testClaimReserved},
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
-			name:   "clear-reserved-delayed-allocation",
+			name:   "clear-reserved-structured",
 			pods:   []*v1.Pod{},
 			key:    claimKey(testClaimReserved),
-			claims: []*resourcev1alpha2.ResourceClaim{testClaimReserved},
-			expectedClaims: func() []resourcev1alpha2.ResourceClaim {
+			claims: []*resourceapi.ResourceClaim{structuredParameters(testClaimReserved)},
+			expectedClaims: func() []resourceapi.ResourceClaim {
 				claim := testClaimAllocated.DeepCopy()
-				claim.Status.DeallocationRequested = true
-				return []resourcev1alpha2.ResourceClaim{*claim}
+				claim.Finalizers = []string{}
+				claim.Status.Allocation = nil
+				return []resourceapi.ResourceClaim{*claim}
 			}(),
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
-			name: "clear-reserved-immediate-allocation",
+			name: "dont-clear-reserved-structured",
+			pods: []*v1.Pod{testPodWithResource},
+			key:  claimKey(testClaimReserved),
+			claims: func() []*resourceapi.ResourceClaim {
+				claim := structuredParameters(testClaimReserved)
+				claim = reserveClaim(claim, otherTestPod)
+				return []*resourceapi.ResourceClaim{claim}
+			}(),
+			expectedClaims:  []resourceapi.ResourceClaim{*structuredParameters(testClaimReserved)},
+			expectedMetrics: expectedMetrics{0, 0},
+		},
+		{
+			name: "clear-reserved-structured-deleted",
 			pods: []*v1.Pod{},
 			key:  claimKey(testClaimReserved),
-			claims: func() []*resourcev1alpha2.ResourceClaim {
-				claim := testClaimReserved.DeepCopy()
-				claim.Spec.AllocationMode = resourcev1alpha2.AllocationModeImmediate
-				return []*resourcev1alpha2.ResourceClaim{claim}
+			claims: func() []*resourceapi.ResourceClaim {
+				claim := structuredParameters(testClaimReserved.DeepCopy())
+				claim.DeletionTimestamp = &metav1.Time{}
+				return []*resourceapi.ResourceClaim{claim}
 			}(),
-			expectedClaims: func() []resourcev1alpha2.ResourceClaim {
-				claim := testClaimAllocated.DeepCopy()
-				claim.Spec.AllocationMode = resourcev1alpha2.AllocationModeImmediate
-				return []resourcev1alpha2.ResourceClaim{*claim}
+			expectedClaims: func() []resourceapi.ResourceClaim {
+				claim := structuredParameters(testClaimAllocated.DeepCopy())
+				claim.DeletionTimestamp = &metav1.Time{}
+				claim.Finalizers = []string{}
+				claim.Status.Allocation = nil
+				return []resourceapi.ResourceClaim{*claim}
 			}(),
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
-			name: "clear-reserved-when-done-delayed-allocation",
+			name: "structured-deleted",
+			pods: []*v1.Pod{},
+			key:  claimKey(testClaimReserved),
+			claims: func() []*resourceapi.ResourceClaim {
+				claim := structuredParameters(testClaimAllocated.DeepCopy())
+				claim.DeletionTimestamp = &metav1.Time{}
+				return []*resourceapi.ResourceClaim{claim}
+			}(),
+			expectedClaims: func() []resourceapi.ResourceClaim {
+				claim := structuredParameters(testClaimAllocated.DeepCopy())
+				claim.DeletionTimestamp = &metav1.Time{}
+				claim.Finalizers = []string{}
+				claim.Status.Allocation = nil
+				return []resourceapi.ResourceClaim{*claim}
+			}(),
+			expectedMetrics: expectedMetrics{0, 0},
+		},
+		{
+			name: "clear-reserved-when-done",
 			pods: func() []*v1.Pod {
 				pods := []*v1.Pod{testPodWithResource.DeepCopy()}
 				pods[0].Status.Phase = v1.PodSucceeded
 				return pods
 			}(),
 			key: claimKey(testClaimReserved),
-			claims: func() []*resourcev1alpha2.ResourceClaim {
-				claims := []*resourcev1alpha2.ResourceClaim{testClaimReserved.DeepCopy()}
+			claims: func() []*resourceapi.ResourceClaim {
+				claims := []*resourceapi.ResourceClaim{testClaimReserved.DeepCopy()}
 				claims[0].OwnerReferences = nil
 				return claims
 			}(),
-			expectedClaims: func() []resourcev1alpha2.ResourceClaim {
-				claims := []resourcev1alpha2.ResourceClaim{*testClaimAllocated.DeepCopy()}
+			expectedClaims: func() []resourceapi.ResourceClaim {
+				claims := []resourceapi.ResourceClaim{*testClaimAllocated.DeepCopy()}
 				claims[0].OwnerReferences = nil
-				claims[0].Status.DeallocationRequested = true
-				return claims
-			}(),
-			expectedMetrics: expectedMetrics{0, 0},
-		},
-		{
-			name: "clear-reserved-when-done-immediate-allocation",
-			pods: func() []*v1.Pod {
-				pods := []*v1.Pod{testPodWithResource.DeepCopy()}
-				pods[0].Status.Phase = v1.PodSucceeded
-				return pods
-			}(),
-			key: claimKey(testClaimReserved),
-			claims: func() []*resourcev1alpha2.ResourceClaim {
-				claims := []*resourcev1alpha2.ResourceClaim{testClaimReserved.DeepCopy()}
-				claims[0].OwnerReferences = nil
-				claims[0].Spec.AllocationMode = resourcev1alpha2.AllocationModeImmediate
-				return claims
-			}(),
-			expectedClaims: func() []resourcev1alpha2.ResourceClaim {
-				claims := []resourcev1alpha2.ResourceClaim{*testClaimAllocated.DeepCopy()}
-				claims[0].OwnerReferences = nil
-				claims[0].Spec.AllocationMode = resourcev1alpha2.AllocationModeImmediate
 				return claims
 			}(),
 			expectedMetrics: expectedMetrics{0, 0},
@@ -356,8 +355,8 @@ func TestSyncHandler(t *testing.T) {
 			name:            "remove-reserved",
 			pods:            []*v1.Pod{testPod},
 			key:             claimKey(testClaimReservedTwice),
-			claims:          []*resourcev1alpha2.ResourceClaim{testClaimReservedTwice},
-			expectedClaims:  []resourcev1alpha2.ResourceClaim{*testClaimReserved},
+			claims:          []*resourceapi.ResourceClaim{testClaimReservedTwice},
+			expectedClaims:  []resourceapi.ResourceClaim{*testClaimReserved},
 			expectedMetrics: expectedMetrics{0, 0},
 		},
 		{
@@ -368,32 +367,17 @@ func TestSyncHandler(t *testing.T) {
 				return pods
 			}(),
 			key:             claimKey(testClaimReserved),
-			claims:          []*resourcev1alpha2.ResourceClaim{testClaimReserved},
+			claims:          []*resourceapi.ResourceClaim{testClaimReserved},
 			expectedClaims:  nil,
 			expectedMetrics: expectedMetrics{0, 0},
-		},
-		{
-			name:           "trigger-allocation",
-			pods:           []*v1.Pod{testPodWithNodeName},
-			key:            podKey(testPodWithNodeName),
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
-			claims:         []*resourcev1alpha2.ResourceClaim{generatedTestClaim},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaim},
-			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
-				testPodWithNodeName.Name: {
-					{Name: testPodWithNodeName.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
-				},
-			},
-			expectedPodSchedulingContexts: []resourcev1alpha2.PodSchedulingContext{podSchedulingContext},
-			expectedMetrics:               expectedMetrics{0, 0},
 		},
 		{
 			name:           "add-reserved",
 			pods:           []*v1.Pod{testPodWithNodeName},
 			key:            podKey(testPodWithNodeName),
-			templates:      []*resourcev1alpha2.ResourceClaimTemplate{template},
-			claims:         []*resourcev1alpha2.ResourceClaim{generatedTestClaimAllocated},
-			expectedClaims: []resourcev1alpha2.ResourceClaim{*generatedTestClaimReserved},
+			templates:      []*resourceapi.ResourceClaimTemplate{template},
+			claims:         []*resourceapi.ResourceClaim{generatedTestClaimAllocated},
+			expectedClaims: []resourceapi.ResourceClaim{*generatedTestClaimReserved},
 			expectedStatuses: map[string][]v1.PodResourceClaimStatus{
 				testPodWithNodeName.Name: {
 					{Name: testPodWithNodeName.Spec.ResourceClaims[0].Name, ResourceClaimName: &generatedTestClaim.Name},
@@ -406,8 +390,8 @@ func TestSyncHandler(t *testing.T) {
 	for _, tc := range tests {
 		// Run sequentially because of global logging and global metrics.
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			tCtx := ktesting.Init(t)
+			tCtx = ktesting.WithCancel(tCtx)
 
 			var objects []runtime.Object
 			for _, pod := range tc.pods {
@@ -429,24 +413,26 @@ func TestSyncHandler(t *testing.T) {
 			setupMetrics()
 			informerFactory := informers.NewSharedInformerFactory(fakeKubeClient, controller.NoResyncPeriodFunc())
 			podInformer := informerFactory.Core().V1().Pods()
-			podSchedulingInformer := informerFactory.Resource().V1alpha2().PodSchedulingContexts()
-			claimInformer := informerFactory.Resource().V1alpha2().ResourceClaims()
-			templateInformer := informerFactory.Resource().V1alpha2().ResourceClaimTemplates()
+			claimInformer := informerFactory.Resource().V1beta1().ResourceClaims()
+			templateInformer := informerFactory.Resource().V1beta1().ResourceClaimTemplates()
 
-			ec, err := NewController(klog.FromContext(ctx), fakeKubeClient, podInformer, podSchedulingInformer, claimInformer, templateInformer)
+			features := Features{
+				AdminAccess:     tc.adminAccessEnabled,
+				PrioritizedList: tc.prioritizedListEnabled,
+			}
+			ec, err := NewController(tCtx.Logger(), features, fakeKubeClient, podInformer, claimInformer, templateInformer)
 			if err != nil {
 				t.Fatalf("error creating ephemeral controller : %v", err)
 			}
 
 			// Ensure informers are up-to-date.
-			go informerFactory.Start(ctx.Done())
+			informerFactory.Start(tCtx.Done())
 			stopInformers := func() {
-				cancel()
+				tCtx.Cancel("stopping informers")
 				informerFactory.Shutdown()
 			}
 			defer stopInformers()
-			informerFactory.WaitForCacheSync(ctx.Done())
-			cache.WaitForCacheSync(ctx.Done(), podInformer.Informer().HasSynced, claimInformer.Informer().HasSynced, templateInformer.Informer().HasSynced)
+			informerFactory.WaitForCacheSync(tCtx.Done())
 
 			// Add claims that only exist in the mutation cache.
 			for _, claim := range tc.claimsInCache {
@@ -456,27 +442,28 @@ func TestSyncHandler(t *testing.T) {
 			// Simulate race: stop informers, add more pods that the controller doesn't know about.
 			stopInformers()
 			for _, pod := range tc.podsLater {
-				_, err := fakeKubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+				_, err := fakeKubeClient.CoreV1().Pods(pod.Namespace).Create(tCtx, pod, metav1.CreateOptions{})
 				if err != nil {
 					t.Fatalf("unexpected error while creating pod: %v", err)
 				}
 			}
 
-			err = ec.syncHandler(context.TODO(), tc.key)
-			if err != nil && !tc.expectedError {
-				t.Fatalf("unexpected error while running handler: %v", err)
+			err = ec.syncHandler(tCtx, tc.key)
+			if err != nil {
+				assert.ErrorContains(t, err, tc.expectedError, "the error message should have contained the expected error message")
+				return
 			}
-			if err == nil && tc.expectedError {
-				t.Fatalf("unexpected success")
+			if tc.expectedError != "" {
+				t.Fatalf("expected error, got none")
 			}
 
-			claims, err := fakeKubeClient.ResourceV1alpha2().ResourceClaims("").List(ctx, metav1.ListOptions{})
+			claims, err := fakeKubeClient.ResourceV1beta1().ResourceClaims("").List(tCtx, metav1.ListOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error while listing claims: %v", err)
 			}
 			assert.Equal(t, normalizeClaims(tc.expectedClaims), normalizeClaims(claims.Items))
 
-			pods, err := fakeKubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+			pods, err := fakeKubeClient.CoreV1().Pods("").List(tCtx, metav1.ListOptions{})
 			if err != nil {
 				t.Fatalf("unexpected error while listing pods: %v", err)
 			}
@@ -492,24 +479,103 @@ func TestSyncHandler(t *testing.T) {
 			}
 			assert.Equal(t, tc.expectedStatuses, actualStatuses, "pod resource claim statuses")
 
-			scheduling, err := fakeKubeClient.ResourceV1alpha2().PodSchedulingContexts("").List(ctx, metav1.ListOptions{})
-			if err != nil {
-				t.Fatalf("unexpected error while listing claims: %v", err)
-			}
-			assert.Equal(t, normalizeScheduling(tc.expectedPodSchedulingContexts), normalizeScheduling(scheduling.Items))
-
 			expectMetrics(t, tc.expectedMetrics)
 		})
 	}
 }
 
-func makeClaim(name, namespace, classname string, owner *metav1.OwnerReference) *resourcev1alpha2.ResourceClaim {
-	claim := &resourcev1alpha2.ResourceClaim{
+func TestResourceClaimEventHandler(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	tCtx = ktesting.WithCancel(tCtx)
+
+	fakeKubeClient := createTestClient()
+	setupMetrics()
+	informerFactory := informers.NewSharedInformerFactory(fakeKubeClient, controller.NoResyncPeriodFunc())
+	podInformer := informerFactory.Core().V1().Pods()
+	claimInformer := informerFactory.Resource().V1beta1().ResourceClaims()
+	templateInformer := informerFactory.Resource().V1beta1().ResourceClaimTemplates()
+	claimClient := fakeKubeClient.ResourceV1beta1().ResourceClaims(testNamespace)
+
+	_, err := NewController(tCtx.Logger(), Features{}, fakeKubeClient, podInformer, claimInformer, templateInformer)
+	tCtx.ExpectNoError(err, "creating ephemeral controller")
+
+	informerFactory.Start(tCtx.Done())
+	stopInformers := func() {
+		tCtx.Cancel("stopping informers")
+		informerFactory.Shutdown()
+	}
+	defer stopInformers()
+
+	var em numMetrics
+
+	_, err = claimClient.Create(tCtx, testClaim, metav1.CreateOptions{})
+	em.claims++
+	ktesting.Step(tCtx, "create claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	modifiedClaim := testClaim.DeepCopy()
+	modifiedClaim.Labels = map[string]string{"foo": "bar"}
+	_, err = claimClient.Update(tCtx, modifiedClaim, metav1.UpdateOptions{})
+	ktesting.Step(tCtx, "modify claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Consistently(tCtx)
+	})
+
+	_, err = claimClient.Update(tCtx, testClaimAllocated, metav1.UpdateOptions{})
+	em.allocated++
+	ktesting.Step(tCtx, "allocate claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	modifiedClaim = testClaimAllocated.DeepCopy()
+	modifiedClaim.Labels = map[string]string{"foo": "bar2"}
+	_, err = claimClient.Update(tCtx, modifiedClaim, metav1.UpdateOptions{})
+	ktesting.Step(tCtx, "modify claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Consistently(tCtx)
+	})
+
+	otherClaimAllocated := testClaimAllocated.DeepCopy()
+	otherClaimAllocated.Name += "2"
+	_, err = claimClient.Create(tCtx, otherClaimAllocated, metav1.CreateOptions{})
+	em.claims++
+	em.allocated++
+	ktesting.Step(tCtx, "create allocated claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	_, err = claimClient.Update(tCtx, testClaim, metav1.UpdateOptions{})
+	em.allocated--
+	ktesting.Step(tCtx, "deallocate claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	err = claimClient.Delete(tCtx, testClaim.Name, metav1.DeleteOptions{})
+	em.claims--
+	ktesting.Step(tCtx, "delete deallocated claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	err = claimClient.Delete(tCtx, otherClaimAllocated.Name, metav1.DeleteOptions{})
+	em.claims--
+	em.allocated--
+	ktesting.Step(tCtx, "delete allocated claim", func(tCtx ktesting.TContext) {
+		tCtx.ExpectNoError(err)
+		em.Eventually(tCtx)
+	})
+
+	em.Consistently(tCtx)
+}
+
+func makeClaim(name, namespace, classname string, owner *metav1.OwnerReference) *resourceapi.ResourceClaim {
+	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Spec: resourcev1alpha2.ResourceClaimSpec{
-			ResourceClassName: classname,
-			AllocationMode:    resourcev1alpha2.AllocationModeWaitForFirstConsumer,
-		},
 	}
 	if owner != nil {
 		claim.OwnerReferences = []metav1.OwnerReference{*owner}
@@ -518,38 +584,53 @@ func makeClaim(name, namespace, classname string, owner *metav1.OwnerReference) 
 	return claim
 }
 
-func makeGeneratedClaim(podClaimName, generateName, namespace, classname string, createCounter int, owner *metav1.OwnerReference) *resourcev1alpha2.ResourceClaim {
-	claim := &resourcev1alpha2.ResourceClaim{
+func makeGeneratedClaim(podClaimName, generateName, namespace, classname string, createCounter int, owner *metav1.OwnerReference, adminAccess *bool) *resourceapi.ResourceClaim {
+	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:         fmt.Sprintf("%s-%d", generateName, createCounter),
 			GenerateName: generateName,
 			Namespace:    namespace,
 			Annotations:  map[string]string{"resource.kubernetes.io/pod-claim-name": podClaimName},
 		},
-		Spec: resourcev1alpha2.ResourceClaimSpec{
-			ResourceClassName: classname,
-			AllocationMode:    resourcev1alpha2.AllocationModeWaitForFirstConsumer,
-		},
 	}
 	if owner != nil {
 		claim.OwnerReferences = []metav1.OwnerReference{*owner}
 	}
-
-	return claim
-}
-
-func allocateClaim(claim *resourcev1alpha2.ResourceClaim) *resourcev1alpha2.ResourceClaim {
-	claim = claim.DeepCopy()
-	claim.Status.Allocation = &resourcev1alpha2.AllocationResult{
-		Shareable: true,
+	if adminAccess != nil {
+		claim.Spec = resourceapi.ResourceClaimSpec{
+			Devices: resourceapi.DeviceClaim{
+				Requests: []resourceapi.DeviceRequest{
+					{
+						Name:            "req-0",
+						DeviceClassName: "class",
+						AdminAccess:     adminAccess,
+					},
+				},
+			},
+		}
 	}
+
 	return claim
 }
 
-func reserveClaim(claim *resourcev1alpha2.ResourceClaim, pod *v1.Pod) *resourcev1alpha2.ResourceClaim {
+func allocateClaim(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	claim = claim.DeepCopy()
+	claim.Status.Allocation = &resourceapi.AllocationResult{}
+	return claim
+}
+
+func structuredParameters(claim *resourceapi.ResourceClaim) *resourceapi.ResourceClaim {
+	claim = claim.DeepCopy()
+	// As far the controller is concerned, a claim was allocated by us if it has
+	// this finalizer. For testing we don't need to update the allocation result.
+	claim.Finalizers = append(claim.Finalizers, resourceapi.Finalizer)
+	return claim
+}
+
+func reserveClaim(claim *resourceapi.ResourceClaim, pod *v1.Pod) *resourceapi.ResourceClaim {
 	claim = claim.DeepCopy()
 	claim.Status.ReservedFor = append(claim.Status.ReservedFor,
-		resourcev1alpha2.ResourceClaimConsumerReference{
+		resourceapi.ResourceClaimConsumerReference{
 			Resource: "pods",
 			Name:     pod.Name,
 			UID:      pod.UID,
@@ -560,10 +641,8 @@ func reserveClaim(claim *resourcev1alpha2.ResourceClaim, pod *v1.Pod) *resourcev
 
 func makePodResourceClaim(name, templateName string) *v1.PodResourceClaim {
 	return &v1.PodResourceClaim{
-		Name: name,
-		Source: v1.ClaimSource{
-			ResourceClaimTemplateName: &templateName,
-		},
+		Name:                      name,
+		ResourceClaimTemplateName: &templateName,
 	}
 }
 
@@ -578,14 +657,24 @@ func makePod(name, namespace string, uid types.UID, podClaims ...v1.PodResourceC
 	return pod
 }
 
-func makeTemplate(name, namespace, classname string) *resourcev1alpha2.ResourceClaimTemplate {
-	template := &resourcev1alpha2.ResourceClaimTemplate{
+func makeTemplate(name, namespace, classname string, adminAccess *bool) *resourceapi.ResourceClaimTemplate {
+	template := &resourceapi.ResourceClaimTemplate{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Spec: resourcev1alpha2.ResourceClaimTemplateSpec{
-			Spec: resourcev1alpha2.ResourceClaimSpec{
-				ResourceClassName: classname,
+	}
+	if adminAccess != nil {
+		template.Spec = resourceapi.ResourceClaimTemplateSpec{
+			Spec: resourceapi.ResourceClaimSpec{
+				Devices: resourceapi.DeviceClaim{
+					Requests: []resourceapi.DeviceRequest{
+						{
+							Name:            "req-0",
+							DeviceClassName: "class",
+							AdminAccess:     adminAccess,
+						},
+					},
+				},
 			},
-		},
+		}
 	}
 	return template
 }
@@ -594,7 +683,7 @@ func podKey(pod *v1.Pod) string {
 	return podKeyPrefix + pod.Namespace + "/" + pod.Name
 }
 
-func claimKey(claim *resourcev1alpha2.ResourceClaim) string {
+func claimKey(claim *resourceapi.ResourceClaim) string {
 	return claimKeyPrefix + claim.Namespace + "/" + claim.Name
 }
 
@@ -610,7 +699,7 @@ func makeOwnerReference(pod *v1.Pod, isController bool) *metav1.OwnerReference {
 	}
 }
 
-func normalizeClaims(claims []resourcev1alpha2.ResourceClaim) []resourcev1alpha2.ResourceClaim {
+func normalizeClaims(claims []resourceapi.ResourceClaim) []resourceapi.ResourceClaim {
 	sort.Slice(claims, func(i, j int) bool {
 		if claims[i].Namespace < claims[j].Namespace {
 			return true
@@ -624,20 +713,8 @@ func normalizeClaims(claims []resourcev1alpha2.ResourceClaim) []resourcev1alpha2
 		if len(claims[i].Status.ReservedFor) == 0 {
 			claims[i].Status.ReservedFor = nil
 		}
-		if claims[i].Spec.AllocationMode == "" {
-			// This emulates defaulting.
-			claims[i].Spec.AllocationMode = resourcev1alpha2.AllocationModeWaitForFirstConsumer
-		}
 	}
 	return claims
-}
-
-func normalizeScheduling(scheduling []resourcev1alpha2.PodSchedulingContext) []resourcev1alpha2.PodSchedulingContext {
-	sort.Slice(scheduling, func(i, j int) bool {
-		return scheduling[i].Namespace < scheduling[j].Namespace ||
-			scheduling[i].Name < scheduling[j].Name
-	})
-	return scheduling
 }
 
 func createTestClient(objects ...runtime.Object) *fake.Clientset {
@@ -654,7 +731,7 @@ func createResourceClaimReactor() func(action k8stesting.Action) (handled bool, 
 	return func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 		mutex.Lock()
 		defer mutex.Unlock()
-		claim := action.(k8stesting.CreateAction).GetObject().(*resourcev1alpha2.ResourceClaim)
+		claim := action.(k8stesting.CreateAction).GetObject().(*resourceapi.ResourceClaim)
 		if claim.Name == "" && claim.GenerateName != "" {
 			claim.Name = fmt.Sprintf("%s-%d", claim.GenerateName, nameCounter)
 		}
@@ -665,6 +742,34 @@ func createResourceClaimReactor() func(action k8stesting.Action) (handled bool, 
 
 // Metrics helpers
 
+type numMetrics struct {
+	claims    float64
+	allocated float64
+}
+
+func getNumMetric() (em numMetrics, err error) {
+	em.claims, err = testutil.GetGaugeMetricValue(metrics.NumResourceClaims)
+	if err != nil {
+		return
+	}
+	em.allocated, err = testutil.GetGaugeMetricValue(metrics.NumAllocatedResourceClaims)
+	return
+}
+
+func (em numMetrics) Eventually(tCtx ktesting.TContext) {
+	g := gomega.NewWithT(tCtx)
+	tCtx.Helper()
+
+	g.Eventually(getNumMetric).WithTimeout(5 * time.Second).Should(gomega.Equal(em))
+}
+
+func (em numMetrics) Consistently(tCtx ktesting.TContext) {
+	g := gomega.NewWithT(tCtx)
+	tCtx.Helper()
+
+	g.Consistently(getNumMetric).WithTimeout(time.Second).Should(gomega.Equal(em))
+}
+
 type expectedMetrics struct {
 	numCreated  int
 	numFailures int
@@ -673,12 +778,12 @@ type expectedMetrics struct {
 func expectMetrics(t *testing.T, em expectedMetrics) {
 	t.Helper()
 
-	actualCreated, err := testutil.GetCounterMetricValue(ephemeralvolumemetrics.ResourceClaimCreateAttempts)
+	actualCreated, err := testutil.GetCounterMetricValue(metrics.ResourceClaimCreateAttempts)
 	handleErr(t, err, "ResourceClaimCreate")
 	if actualCreated != float64(em.numCreated) {
 		t.Errorf("Expected claims to be created %d, got %v", em.numCreated, actualCreated)
 	}
-	actualConflicts, err := testutil.GetCounterMetricValue(ephemeralvolumemetrics.ResourceClaimCreateFailures)
+	actualConflicts, err := testutil.GetCounterMetricValue(metrics.ResourceClaimCreateFailures)
 	handleErr(t, err, "ResourceClaimCreate/Conflict")
 	if actualConflicts != float64(em.numFailures) {
 		t.Errorf("Expected claims to have conflicts %d, got %v", em.numFailures, actualConflicts)
@@ -692,7 +797,9 @@ func handleErr(t *testing.T, err error, metricName string) {
 }
 
 func setupMetrics() {
-	ephemeralvolumemetrics.RegisterMetrics()
-	ephemeralvolumemetrics.ResourceClaimCreateAttempts.Reset()
-	ephemeralvolumemetrics.ResourceClaimCreateFailures.Reset()
+	metrics.RegisterMetrics()
+	metrics.ResourceClaimCreateAttempts.Reset()
+	metrics.ResourceClaimCreateFailures.Reset()
+	metrics.NumResourceClaims.Set(0)
+	metrics.NumAllocatedResourceClaims.Set(0)
 }

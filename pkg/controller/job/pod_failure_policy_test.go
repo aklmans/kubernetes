@@ -23,11 +23,12 @@ import (
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilversion "k8s.io/apimachinery/pkg/util/version"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/kubernetes/pkg/features"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 func TestMatchPodFailurePolicy(t *testing.T) {
@@ -83,7 +84,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 1"),
+			wantJobFailureMessage: ptr.To("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 1"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -161,7 +162,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 1"),
+			wantJobFailureMessage: ptr.To("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 1"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -216,6 +217,37 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 			wantCountFailed:       false,
 			wantAction:            &ignore,
 		},
+		"ignore rule matched on negative exit codes - needed for Windows support": {
+			podFailurePolicy: &batch.PodFailurePolicy{
+				Rules: []batch.PodFailurePolicyRule{
+					{
+						Action: batch.PodFailurePolicyActionIgnore,
+						OnExitCodes: &batch.PodFailurePolicyOnExitCodesRequirement{
+							Operator: batch.PodFailurePolicyOnExitCodesOpIn,
+							Values:   []int32{-1073741676, -1073741510},
+						},
+					},
+				},
+			},
+			failedPod: &v1.Pod{
+				ObjectMeta: validPodObjectMeta,
+				Status: v1.PodStatus{
+					Phase: v1.PodFailed,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Terminated: &v1.ContainerStateTerminated{
+									ExitCode: -1073741510,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantJobFailureMessage: nil,
+			wantCountFailed:       false,
+			wantAction:            &ignore,
+		},
 		"FailJob rule matched for exit codes": {
 			podFailurePolicy: &batch.PodFailurePolicy{
 				Rules: []batch.PodFailurePolicyRule{
@@ -244,7 +276,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 0"),
+			wantJobFailureMessage: ptr.To("Container main-container for pod default/mypod failed with exit code 2 matching FailJob rule at index 0"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -395,7 +427,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Container main-container for pod default/mypod failed with exit code 1 matching FailJob rule at index 0"),
+			wantJobFailureMessage: ptr.To("Container main-container for pod default/mypod failed with exit code 1 matching FailJob rule at index 0"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -434,7 +466,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Container main-container for pod default/mypod failed with exit code 6 matching FailJob rule at index 1"),
+			wantJobFailureMessage: ptr.To("Container main-container for pod default/mypod failed with exit code 6 matching FailJob rule at index 1"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -736,7 +768,7 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 					},
 				},
 			},
-			wantJobFailureMessage: pointer.String("Pod default/mypod has condition DisruptionTarget matching FailJob rule at index 0"),
+			wantJobFailureMessage: ptr.To("Pod default/mypod has condition DisruptionTarget matching FailJob rule at index 0"),
 			wantCountFailed:       true,
 			wantAction:            &failJob,
 		},
@@ -836,7 +868,11 @@ func TestMatchPodFailurePolicy(t *testing.T) {
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)()
+			if !tc.enableJobBackoffLimitPerIndex {
+				// TODO: this will be removed in 1.36
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.32"))
+			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.JobBackoffLimitPerIndex, tc.enableJobBackoffLimitPerIndex)
 			jobFailMessage, countFailed, action := matchPodFailurePolicy(tc.podFailurePolicy, tc.failedPod)
 			if diff := cmp.Diff(tc.wantJobFailureMessage, jobFailMessage); diff != "" {
 				t.Errorf("Unexpected job failure message: %s", diff)

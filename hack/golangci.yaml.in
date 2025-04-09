@@ -2,8 +2,6 @@
 # enable an increasing amount of checks:
 # - golangci.yaml is the most permissive configuration. All existing code
 #   passed.
-# - golangci-strict.yaml adds checks that all new code in pull requests
-#   must pass.
 # - golangci-hints.yaml adds checks for code patterns where developer
 #   and reviewer may decide whether findings should get addressed before
 #   merging. Beware that the golangci-lint output includes also the
@@ -15,8 +13,6 @@
 
 run:
   timeout: 30m
-  skip-files:
-    - "^zz_generated.*"
 
 output:
   sort-results: true
@@ -24,6 +20,18 @@ output:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
+
+  # The default excludes disable the "should have comment or be unexported" check from revive.
+  # We want that to be enabled, therefore we have to disable all default excludes and
+  # add those back one-by-one that we want. See https://github.com/golangci/golangci-lint/issues/456#issuecomment-617470264
+  exclude-use-default: false
+  exclude:
+    # staticcheck: Developers tend to write in C-style with an explicit 'break' in a 'switch', so it's ok to ignore
+    - ineffective break statement. Did you mean to break out of the outer loop
+
+  exclude-files:
+    - "^zz_generated.*"
+
   # Excluding configuration per-path, per-linter, per-text and per-source
   exclude-rules:
     # exclude ineffassign linter for generated files for conversion
@@ -35,6 +43,12 @@ issues:
     - linters:
         - forbidigo
       text: should not be used because managedFields was removed
+      path: _test.go$
+
+    # Adding unversioned feature gates is allowed in tests
+    - linters:
+        - forbidigo
+      text: should not use Add, use AddVersioned instead
       path: _test.go$
 
     {{- if .Base}}
@@ -54,17 +68,60 @@ issues:
     # https://github.com/kubernetes/kubernetes/issues/117288#issuecomment-1514201592
     - linters:
         - stylecheck
-      text: "ST1003: should not use underscores in Go names; func (Convert_.*_To_.*|SetDefaults_)"
+        - revive
+      text: "(ST1003: should not use underscores in Go names; func (Convert_.*_To_.*|SetDefaults_)|exported: exported function (Convert|SetDefaults)_.* should be of the form)"
 
     # This check currently has some false positives (https://github.com/nunnatsa/ginkgolinter/issues/91).
     - linters:
        - ginkgolinter
       text: use a function call in (Eventually|Consistently)
 
+    {{- if .Base}}
+
+    # Some of these seem legitimate, maybe better fix code (https://github.com/kubernetes/kubernetes/issues/130449).
+
+    - linters:
+        - govet
+      text: "lostcancel|printf"
+
+    - linters:
+        - ginkgolinter
+      text: "wrong error assertion. Consider using `gomega.(Eventually|Consistently)|wrong comparison assertion|wrong length assertion"
+
+    - linters:
+        - testifylint
+      text: "encoded-compare|error-nil|formatter"
+
+    - linters:
+        - gocritic
+      text: "append result not assigned to the same slice|put a space between `//` and comment text|sloppyLen|elseif|should rewrite switch statement to if statement|regexpMust|wrapperFunc: use strings.ReplaceAll|singleCaseSwitch|deprecatedComment|exitAfterDefer|captLocal|unlambda|underef|unslice|valSwap|typeSwitchVar"
+    {{- end}}
+
     # https://github.com/kubernetes/kubernetes/issues/117288#issuecomment-1507012435
     - linters:
         - gocritic
       text: "ifElseChain: rewrite if-else to switch statement"
+
+    # Only packages listed here opt into the strict "exported symbols must be documented".
+    #
+    # Exclude texts from https://github.com/golangci/golangci-lint/blob/ab3c3cd69e602ff53bb4c3e2c188f0caeb80305d/pkg/config/issues.go#L11-L103
+    - linters:
+        - golint
+        - revive
+        - stylecheck
+      text: comment on exported (method|function|type|const)|should have( a package)? comment|comment should be of the form|comment on exported (method|function|type|const)|should have( a package)? comment|comment should be of the form|exported (.+) should have comment( \(or a comment on this block\))? or be unexported|package comment should be of the form "(.+)...|comment on exported (.+) should be of the form "(.+)...|should have a package comment
+      path-except: cmd/kubeadm
+
+    # The unused linter that comes from staticcheck currently does not handle types which implement
+    # a generic interface. The linter incorrectly reports the implementations of unexported
+    # interface methods as unused. See https://github.com/dominikh/go-tools/issues/1294.
+    # Rather than exporting the interface methods, which makes the error go away but changes the
+    # semantics of the code, we ignore this error for affected files.
+    # This can be removed when the staticcheck implementation of this rule is fixed, which may
+    # depend on https://github.com/golang/go/issues/63982.
+    - linters:
+        - unused
+      path: staging/src/k8s.io/client-go/util/workqueue/metrics.go
 
     {{- if not .Hints}}
 
@@ -116,19 +173,23 @@ issues:
 linters:
   disable-all: {{if .Base -}} true {{- else -}} false {{- end}}
   enable: # please keep this alphabetized
+    - depguard
     - forbidigo
     - ginkgolinter
     - gocritic
     - govet
+    {{- if .Hints}}
+    - errorlint
+    {{- end}}
     - ineffassign
     - logcheck
+    - revive
     - staticcheck
     - stylecheck
+    - testifylint
     - unused
-  {{- if .Strict}}
-  disable:
-    # https://github.com/kubernetes/kubernetes/issues/117288#issuecomment-1507008359
-    - errcheck
+  {{- if not .Base }}
+    - usestdlibvars
   {{- end}}
 
 linters-settings: # please keep this alphabetized
@@ -138,6 +199,19 @@ linters-settings: # please keep this alphabetized
       path: ../_output/local/bin/logcheck.so
       description: structured logging checker
       original-url: k8s.io/logtools/logcheck
+      settings:
+        config: |
+          {{include "hack/logcheck.conf" | indent 10 | trim}}
+  depguard:
+    rules:
+      main:
+        files:
+          - $all
+          - "!$test"
+          - "!**/test/**"
+        deny:
+          - pkg: "github.com/google/go-cmp/cmp"
+            desc: "cmp is allowed only in test files"
   forbidigo:
     analyze-types: true
     forbid:
@@ -147,21 +221,48 @@ linters-settings: # please keep this alphabetized
     - p: \.Extract
       pkg: ^k8s\.io/client-go/applyconfigurations/
       msg: should not be used because managedFields was removed
+    - p: \.Add$
+      pkg: ^k8s\.io/component-base/featuregate$
+      msg: should not use Add, use AddVersioned instead
+    {{- if .Hints}}
+    - p: ^gomega\.BeTrue$
+      pkg: ^github.com/onsi/gomega$
+      msg: "it does not produce a good failure message - use BeTrueBecause with an explicit printf-style failure message instead, or plain Go: if ... { ginkgo.Fail(...) }"
+    - p: ^gomega\.BeFalse$
+      pkg: ^github.com/onsi/gomega$
+      msg: "it does not produce a good failure message - use BeFalseBecause with an explicit printf-style failure message instead, or plain Go: if ... { ginkgo.Fail(...) }"
+    {{- end}}
   {{- if .Base }}
   gocritic:
     enabled-checks:
       - equalFold
       - boolExprSimplify
   {{- end}}
+  revive:
+    # Only these rules are enabled.
+    rules:
+      - name: exported
+        arguments:
+        - disableStutteringCheck
   staticcheck:
     checks:
       - "all"
       {{- if .Base }}
       - "-SA1019"  # TODO(fix) Using a deprecated function, variable, constant or field
       - "-SA2002"  # TODO(fix) Called testing.T.FailNow or SkipNow in a goroutine, which isn’t allowed
+      - "-SA1006"  # TODO(fix) Using a printf-style function with a dynamic format string and no arguments can just use a print-style func
       {{- end}}
   {{- if .Base }}
   stylecheck:
     checks:
       - "ST1019"   # Importing the same package multiple times
   {{- end}}
+  testifylint:
+    enable-all: true
+    {{- if not .Hints }}
+    disable:  # TODO: remove each disabled rule and fix it
+      {{- if .Base }}
+      - float-compare
+      {{- end}}
+      - require-error
+    {{- end}}

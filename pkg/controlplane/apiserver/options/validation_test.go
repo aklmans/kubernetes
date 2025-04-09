@@ -17,13 +17,15 @@ limitations under the License.
 package options
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
 	kubeapiserveradmission "k8s.io/apiserver/pkg/admission"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/component-base/featuregate"
+	basecompatibility "k8s.io/component-base/compatibility"
 	basemetrics "k8s.io/component-base/metrics"
 	"k8s.io/kubernetes/pkg/features"
 
@@ -33,7 +35,7 @@ import (
 )
 
 func TestValidateAPIPriorityAndFairness(t *testing.T) {
-	const conflict = "conflicts with --enable-priority-and-fairness=true and --feature-gates=APIPriorityAndFairness=true"
+	const conflict = "conflicts with --enable-priority-and-fairness=true"
 	tests := []struct {
 		runtimeConfig    string
 		errShouldContain string
@@ -44,7 +46,15 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 		},
 		{
 			runtimeConfig:    "api/beta=false",
+			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "api/ga=false",
 			errShouldContain: conflict,
+		},
+		{
+			runtimeConfig:    "api/ga=true",
+			errShouldContain: "",
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta1=false",
@@ -56,18 +66,30 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=false",
-			errShouldContain: conflict,
+			errShouldContain: "",
 		},
 		{
 			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=true",
 			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1=true",
+			errShouldContain: "",
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1=false",
+			errShouldContain: conflict,
+		},
+		{
+			runtimeConfig:    "flowcontrol.apiserver.k8s.io/v1beta3=true,flowcontrol.apiserver.k8s.io/v1=false",
+			errShouldContain: conflict,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.runtimeConfig, func(t *testing.T) {
 			options := &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{
+				Features: &genericoptions.FeatureOptions{
 					EnablePriorityAndFairness: true,
 				},
 				APIEnablement: genericoptions.NewAPIEnablementOptions(),
@@ -78,8 +100,16 @@ func TestValidateAPIPriorityAndFairness(t *testing.T) {
 			if errs := validateAPIPriorityAndFairness(options); len(errs) > 0 {
 				errMessageGot = errs[0].Error()
 			}
-			if !strings.Contains(errMessageGot, test.errShouldContain) {
-				t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
+
+			switch {
+			case len(test.errShouldContain) == 0:
+				if len(errMessageGot) > 0 {
+					t.Errorf("Expected no error, but got: %q", errMessageGot)
+				}
+			default:
+				if !strings.Contains(errMessageGot, test.errShouldContain) {
+					t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
+				}
 			}
 		})
 	}
@@ -120,7 +150,7 @@ func TestValidateUnknownVersionInteroperabilityProxy(t *testing.T) {
 				PeerAdvertiseAddress: test.peerAdvertiseAddress,
 			}
 			if test.featureEnabled {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.UnknownVersionInteroperabilityProxy, true)()
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.UnknownVersionInteroperabilityProxy, true)
 			}
 			var errMessageGot string
 			if errs := validateUnknownVersionInteroperabilityProxyFlags(options); len(errs) > 0 {
@@ -130,34 +160,6 @@ func TestValidateUnknownVersionInteroperabilityProxy(t *testing.T) {
 				t.Errorf("Expected error message to contain: %q, but got: %q", test.errShouldContain, errMessageGot)
 			}
 
-		})
-	}
-}
-
-func TestValidateUnknownVersionInteroperabilityProxyFeature(t *testing.T) {
-	const conflict = "UnknownVersionInteroperabilityProxy feature requires StorageVersionAPI feature flag to be enabled"
-	tests := []struct {
-		name            string
-		featuresEnabled []featuregate.Feature
-	}{
-		{
-			name:            "enabled: UnknownVersionInteroperabilityProxy, disabled: StorageVersionAPI",
-			featuresEnabled: []featuregate.Feature{features.UnknownVersionInteroperabilityProxy},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			for _, feature := range test.featuresEnabled {
-				defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, feature, true)()
-			}
-			var errMessageGot string
-			if errs := validateUnknownVersionInteroperabilityProxyFeature(); len(errs) > 0 {
-				errMessageGot = errs[0].Error()
-			}
-			if !strings.Contains(errMessageGot, conflict) {
-				t.Errorf("Expected error message to contain: %q, but got: %q", conflict, errMessageGot)
-			}
 		})
 	}
 }
@@ -172,7 +174,7 @@ func TestValidateOptions(t *testing.T) {
 			name:         "validate master count equal 0",
 			expectErrors: true,
 			options: &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{},
+				GenericServerRunOptions: &genericoptions.ServerRunOptions{ComponentGlobalsRegistry: basecompatibility.NewComponentGlobalsRegistry()},
 				Etcd:                    &genericoptions.EtcdOptions{},
 				SecureServing:           &genericoptions.SecureServingOptionsWithLoopback{},
 				Audit:                   &genericoptions.AuditOptions{},
@@ -192,13 +194,14 @@ func TestValidateOptions(t *testing.T) {
 				APIEnablement:                genericoptions.NewAPIEnablementOptions(),
 				Metrics:                      &basemetrics.Options{},
 				ServiceAccountSigningKeyFile: "",
+				Features:                     &genericoptions.FeatureOptions{},
 			},
 		},
 		{
 			name:         "validate token request enable not attempted",
 			expectErrors: true,
 			options: &Options{
-				GenericServerRunOptions: &genericoptions.ServerRunOptions{},
+				GenericServerRunOptions: &genericoptions.ServerRunOptions{ComponentGlobalsRegistry: basecompatibility.NewComponentGlobalsRegistry()},
 				Etcd:                    &genericoptions.EtcdOptions{},
 				SecureServing:           &genericoptions.SecureServingOptionsWithLoopback{},
 				Audit:                   &genericoptions.AuditOptions{},
@@ -215,6 +218,7 @@ func TestValidateOptions(t *testing.T) {
 				APIEnablement:                genericoptions.NewAPIEnablementOptions(),
 				Metrics:                      &basemetrics.Options{},
 				ServiceAccountSigningKeyFile: "",
+				Features:                     &genericoptions.FeatureOptions{},
 			},
 		},
 	}
@@ -228,6 +232,189 @@ func TestValidateOptions(t *testing.T) {
 
 			if len(errs) == 0 && tc.expectErrors {
 				t.Errorf("expected errors, no errors found")
+			}
+		})
+	}
+}
+
+func TestValidateServcieAccountTokenSigningConfig(t *testing.T) {
+	tests := []struct {
+		name           string
+		featureEnabled bool
+		options        *Options
+		expectedErrors []error
+	}{
+		{
+			name:           "Signing keys file provided while external signer endpoint is provided",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+			},
+		},
+		{
+			name:           "Verification keys file provided while external signer endpoint is provided",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"abc",
+							"efg",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:           "Verification key  and signing key file provided while external signer endpoint is provided",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"/abc/efg",
+							"/abc/xyz",
+						},
+					},
+				},
+			},
+		},
+		{
+			name:           "feature disabled and external signer endpoint is provided",
+			featureEnabled: false,
+			expectedErrors: []error{
+				fmt.Errorf("setting `--service-account-signing-endpoint` requires enabling ExternalServiceAccountTokenSigner feature gate"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+			},
+		},
+		{
+			name:           "invalid external signer endpoint provided - 1",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"abc\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "abc",
+			},
+		},
+		{
+			name:           "invalid external signer endpoint provided - 2",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"@abc@\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@abc@",
+			},
+		},
+		{
+			name:           "invalid external signer endpoint provided - 3",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"@abc.abc  .ae\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@abc.abc  .ae",
+			},
+		},
+		{
+			name:           "invalid external signer endpoint provided - 4",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"/@e_adnb/xyz /efg\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "/@e_adnb/xyz /efg",
+			},
+		},
+		{
+			name:           "invalid external signer endpoint provided - 5",
+			featureEnabled: true,
+			expectedErrors: []error{
+				fmt.Errorf("invalid value \"/e /xyz /efg\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "/e /xyz /efg",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 1",
+			featureEnabled: true,
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "/e/an_b-d/efg",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 2",
+			featureEnabled: true,
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.sock",
+			},
+		},
+		{
+			name:           "valid external signer endpoint provided - 3",
+			featureEnabled: true,
+			expectedErrors: []error{},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "@ebc.eng.hij",
+			},
+		},
+		{
+			name:           "All errors at once",
+			featureEnabled: false,
+			expectedErrors: []error{
+				fmt.Errorf("can't set `--service-account-signing-key-file` and/or `--service-account-key-file` with `--service-account-signing-endpoint` (They are mutually exclusive)"),
+				fmt.Errorf("setting `--service-account-signing-endpoint` requires enabling ExternalServiceAccountTokenSigner feature gate"),
+				fmt.Errorf("invalid value \"/e /xyz /efg\" passed for `--service-account-signing-endpoint`, should be a valid location on the filesystem or must be prefixed with @ to name UDS in abstract namespace"),
+			},
+			options: &Options{
+				ServiceAccountSigningEndpoint: "/e /xyz /efg",
+				ServiceAccountSigningKeyFile:  "/abc/efg",
+				Authentication: &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{
+							"/abc/xyz",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			if test.options.Authentication == nil {
+				test.options.Authentication = &kubeoptions.BuiltInAuthenticationOptions{
+					ServiceAccounts: &kubeoptions.ServiceAccountAuthenticationOptions{
+						KeyFiles: []string{},
+					},
+				}
+			}
+
+			if test.featureEnabled {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ExternalServiceAccountTokenSigner, true)
+			}
+			errs := validateServiceAccountTokenSigningConfig(test.options)
+			if !reflect.DeepEqual(errs, test.expectedErrors) {
+				t.Errorf("Expected errors message: %v \n but got: %v", test.expectedErrors, errs)
 			}
 		})
 	}

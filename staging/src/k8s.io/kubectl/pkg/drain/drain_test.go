@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 	ktest "k8s.io/client-go/testing"
 )
@@ -72,10 +71,27 @@ func TestDeletePods(t *testing.T) {
 						newPod := newPodMap[name]
 						return &newPod, nil
 					}
-					return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, name)
-
+					return &corev1.Pod{}, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, name)
 				}
-				return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, name)
+				return &corev1.Pod{}, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, name)
+			},
+		},
+		{
+			description:       "Pod found with same name but different UID",
+			interval:          100 * time.Millisecond,
+			timeout:           10 * time.Second,
+			expectPendingPods: false,
+			expectError:       false,
+			expectedError:     nil,
+			getPodFn: func(namespace, name string) (*corev1.Pod, error) {
+				// Return a pod with the same name, but different UID
+				return &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: namespace,
+						Name:      name,
+						UID:       "SOME_OTHER_UID",
+					},
+				}, nil
 			},
 		},
 		{
@@ -84,13 +100,13 @@ func TestDeletePods(t *testing.T) {
 			timeout:           3 * time.Second,
 			expectPendingPods: true,
 			expectError:       true,
-			expectedError:     &wait.ErrWaitTimeout,
+			expectedError:     &context.DeadlineExceeded,
 			getPodFn: func(namespace, name string) (*corev1.Pod, error) {
 				oldPodMap, _ := createPods(false)
 				if oldPod, found := oldPodMap[name]; found {
 					return &oldPod, nil
 				}
-				return nil, fmt.Errorf("%q: not found", name)
+				return &corev1.Pod{}, fmt.Errorf("%q: not found", name)
 			},
 		},
 		{
@@ -100,13 +116,13 @@ func TestDeletePods(t *testing.T) {
 			ctxTimeoutEarly:   true,
 			expectPendingPods: true,
 			expectError:       true,
-			expectedError:     &wait.ErrWaitTimeout,
+			expectedError:     &context.Canceled,
 			getPodFn: func(namespace, name string) (*corev1.Pod, error) {
 				oldPodMap, _ := createPods(false)
 				if oldPod, found := oldPodMap[name]; found {
 					return &oldPod, nil
 				}
-				return nil, fmt.Errorf("%q: not found", name)
+				return &corev1.Pod{}, fmt.Errorf("%q: not found", name)
 			},
 		},
 		{
@@ -123,7 +139,7 @@ func TestDeletePods(t *testing.T) {
 					oldPod.ObjectMeta.SetDeletionTimestamp(dTime)
 					return &oldPod, nil
 				}
-				return nil, fmt.Errorf("%q: not found", name)
+				return &corev1.Pod{}, fmt.Errorf("%q: not found", name)
 			},
 		},
 		{
@@ -134,7 +150,7 @@ func TestDeletePods(t *testing.T) {
 			expectError:       true,
 			expectedError:     nil,
 			getPodFn: func(namespace, name string) (*corev1.Pod, error) {
-				return nil, errors.New("This is a random error for testing")
+				return &corev1.Pod{}, errors.New("This is a random error for testing")
 			},
 		},
 	}

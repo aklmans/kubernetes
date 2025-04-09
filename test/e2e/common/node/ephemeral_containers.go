@@ -37,7 +37,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
+var _ = SIGDescribe("Ephemeral Containers", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("ephemeral-containers-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelBaseline
 	var podClient *e2epod.PodClient
@@ -63,6 +63,7 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 				},
 			},
 		})
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		ginkgo.By("adding an ephemeral container")
 		ecName := "debugger"
@@ -77,6 +78,11 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 		}
 		err := podClient.AddEphemeralContainerSync(ctx, pod, ec, time.Minute)
 		framework.ExpectNoError(err, "Failed to patch ephemeral containers in pod %q", e2epod.FormatPod(pod))
+
+		ginkgo.By("verifying the pod's generation is 2")
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to query for pod")
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(2))
 
 		ginkgo.By("checking pod container endpoints")
 		// Can't use anything depending on kubectl here because it's not available in the node test environment
@@ -110,6 +116,7 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 				},
 			},
 		})
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(1))
 
 		ginkgo.By("adding an ephemeral container")
 		ecName := "debugger"
@@ -124,6 +131,11 @@ var _ = SIGDescribe("Ephemeral Containers [NodeConformance]", func() {
 		}
 		err := podClient.AddEphemeralContainerSync(ctx, pod, ec, time.Minute)
 		framework.ExpectNoError(err, "Failed to patch ephemeral containers in pod %q", e2epod.FormatPod(pod))
+
+		ginkgo.By("verifying the pod's generation is 2")
+		pod, err = podClient.Get(ctx, pod.Name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "failed to query for pod")
+		gomega.Expect(pod.Generation).To(gomega.BeEquivalentTo(2))
 
 		ginkgo.By("checking pod container endpoints")
 		// Can't use anything depending on kubectl here because it's not available in the node test environment

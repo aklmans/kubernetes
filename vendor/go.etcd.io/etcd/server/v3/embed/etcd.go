@@ -17,6 +17,7 @@ package embed
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	defaultLog "log"
@@ -80,11 +81,23 @@ type Etcd struct {
 
 	Server *etcdserver.EtcdServer
 
-	cfg   Config
-	stopc chan struct{}
-	errc  chan error
+	cfg Config
 
+	// closeOnce is to ensure `stopc` is closed only once, no matter
+	// how many times the Close() method is called.
 	closeOnce sync.Once
+	// stopc is used to notify the sub goroutines not to send
+	// any errors to `errc`.
+	stopc chan struct{}
+	// errc is used to receive error from sub goroutines (including
+	// client handler, peer handler and metrics handler). It's closed
+	// after all these sub goroutines exit (checked via `wg`). Writers
+	// should avoid writing after `stopc` is closed by selecting on
+	// reading from `stopc`.
+	errc chan error
+
+	// wg is used to track the lifecycle of all sub goroutines created by `StartEtcd`.
+	wg sync.WaitGroup
 }
 
 type peerListener struct {
@@ -110,7 +123,7 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		if !serving {
 			// errored before starting gRPC server for serveCtx.serversC
 			for _, sctx := range e.sctxs {
-				close(sctx.serversC)
+				sctx.close()
 			}
 		}
 		e.Close()
@@ -217,26 +230,27 @@ func StartEtcd(inCfg *Config) (e *Etcd, err error) {
 		EnableLeaseCheckpoint:                    cfg.ExperimentalEnableLeaseCheckpoint,
 		LeaseCheckpointPersist:                   cfg.ExperimentalEnableLeaseCheckpointPersist,
 		CompactionBatchLimit:                     cfg.ExperimentalCompactionBatchLimit,
+		CompactionSleepInterval:                  cfg.ExperimentalCompactionSleepInterval,
 		WatchProgressNotifyInterval:              cfg.ExperimentalWatchProgressNotifyInterval,
 		DowngradeCheckTime:                       cfg.ExperimentalDowngradeCheckTime,
 		WarningApplyDuration:                     cfg.ExperimentalWarningApplyDuration,
 		ExperimentalMemoryMlock:                  cfg.ExperimentalMemoryMlock,
 		ExperimentalTxnModeWriteWithSharedBuffer: cfg.ExperimentalTxnModeWriteWithSharedBuffer,
+		ExperimentalStopGRPCServiceOnDefrag:      cfg.ExperimentalStopGRPCServiceOnDefrag,
 		ExperimentalBootstrapDefragThresholdMegabytes: cfg.ExperimentalBootstrapDefragThresholdMegabytes,
 		V2Deprecation: cfg.V2DeprecationEffective(),
 	}
 
 	if srvcfg.ExperimentalEnableDistributedTracing {
 		tctx := context.Background()
-		tracingExporter, opts, err := setupTracingExporter(tctx, cfg)
+		tracingExporter, err := newTracingExporter(tctx, cfg)
 		if err != nil {
 			return e, err
 		}
-		if tracingExporter == nil || len(opts) == 0 {
-			return e, fmt.Errorf("error setting up distributed tracing")
+		e.tracingExporterShutdown = func() {
+			tracingExporter.Close(tctx)
 		}
-		e.tracingExporterShutdown = func() { tracingExporter.Shutdown(tctx) }
-		srvcfg.ExperimentalTracerOptions = opts
+		srvcfg.ExperimentalTracerOptions = tracingExporter.opts
 
 		e.cfg.logger.Info("distributed tracing setup enabled")
 	}
@@ -365,6 +379,24 @@ func (e *Etcd) Config() Config {
 // Close gracefully shuts down all servers/listeners.
 // Client requests will be terminated with request timeout.
 // After timeout, enforce remaning requests be closed immediately.
+//
+// The rough workflow to shut down etcd:
+//  1. close the `stopc` channel, so that all error handlers (child
+//     goroutines) won't send back any errors anymore;
+//  2. stop the http and grpc servers gracefully, within request timeout;
+//  3. close all client and metrics listeners, so that etcd server
+//     stops receiving any new connection;
+//  4. call the cancel function to close the gateway context, so that
+//     all gateway connections are closed.
+//  5. stop etcd server gracefully, and ensure the main raft loop
+//     goroutine is stopped;
+//  6. stop all peer listeners, so that it stops receiving peer connections
+//     and messages (wait up to 1-second);
+//  7. wait for all child goroutines (i.e. client handlers, peer handlers
+//     and metrics handlers) to exit;
+//  8. close the `errc` channel to release the resource. Note that it's only
+//     safe to close the `errc` after step 7 above is done, otherwise the
+//     child goroutines may send errors back to already closed `errc` channel.
 func (e *Etcd) Close() {
 	fields := []zap.Field{
 		zap.String("name", e.cfg.Name),
@@ -434,6 +466,7 @@ func (e *Etcd) Close() {
 		}
 	}
 	if e.errc != nil {
+		e.wg.Wait()
 		close(e.errc)
 	}
 }
@@ -534,6 +567,7 @@ func configurePeerListeners(cfg *Config) (peers []*peerListener, err error) {
 			transport.WithTimeout(rafthttp.ConnReadTimeout, rafthttp.ConnWriteTimeout),
 		)
 		if err != nil {
+			cfg.logger.Error("creating peer listener failed", zap.Error(err))
 			return nil, err
 		}
 		// once serve, overwrite with 'http.Server.Shutdown'
@@ -592,7 +626,9 @@ func (e *Etcd) servePeers() (err error) {
 
 	// start peer servers in a goroutine
 	for _, pl := range e.Peers {
+		e.wg.Add(1)
 		go func(l *peerListener) {
+			defer e.wg.Done()
 			u := l.Addr().String()
 			e.cfg.logger.Info(
 				"serving peer traffic",
@@ -622,10 +658,10 @@ func configureClientListeners(cfg *Config) (sctxs map[string]*serveCtx, err erro
 	for _, u := range append(cfg.ListenClientUrls, cfg.ListenClientHttpUrls...) {
 		if u.Scheme == "http" || u.Scheme == "unix" {
 			if !cfg.ClientTLSInfo.Empty() {
-				cfg.logger.Warn("scheme is HTTP while key and cert files are present; ignoring key and cert files", zap.String("client-url", u.String()))
+				cfg.logger.Warn("scheme is http or unix while key and cert files are present; ignoring key and cert files", zap.String("client-url", u.String()))
 			}
 			if cfg.ClientTLSInfo.ClientCertAuth {
-				cfg.logger.Warn("scheme is HTTP while --client-cert-auth is enabled; ignoring client cert auth for this URL", zap.String("client-url", u.String()))
+				cfg.logger.Warn("scheme is http or unix while --client-cert-auth is enabled; ignoring client cert auth for this URL", zap.String("client-url", u.String()))
 			}
 		}
 		if (u.Scheme == "https" || u.Scheme == "unixs") && cfg.ClientTLSInfo.Empty() {
@@ -747,7 +783,8 @@ func (e *Etcd) serveClients() (err error) {
 	} else {
 		mux := http.NewServeMux()
 		etcdhttp.HandleBasic(e.cfg.logger, mux, e.Server)
-		etcdhttp.HandleMetricsHealthForV3(e.cfg.logger, mux, e.Server)
+		etcdhttp.HandleMetrics(mux)
+		etcdhttp.HandleHealth(e.cfg.logger, mux, e.Server)
 		h = mux
 	}
 
@@ -775,7 +812,9 @@ func (e *Etcd) serveClients() (err error) {
 
 	// start client servers in each goroutine
 	for _, sctx := range e.sctxs {
+		e.wg.Add(1)
 		go func(s *serveCtx) {
+			defer e.wg.Done()
 			e.errHandler(s.serve(e.Server, &e.cfg.ClientTLSInfo, h, e.errHandler, e.grpcGatewayDial(splitHttp), splitHttp, gopts...))
 		}(sctx)
 	}
@@ -790,7 +829,7 @@ func (e *Etcd) grpcGatewayDial(splitHttp bool) (grpcDial func(ctx context.Contex
 	addr := sctx.addr
 	if network := sctx.network; network == "unix" {
 		// explicitly define unix network for gRPC socket support
-		addr = fmt.Sprintf("%s://%s", network, addr)
+		addr = fmt.Sprintf("%s:%s", network, addr)
 	}
 
 	opts := []grpc.DialOption{grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32))}
@@ -829,6 +868,24 @@ func (e *Etcd) pickGrpcGatewayServeContext(splitHttp bool) *serveCtx {
 	panic("Expect at least one context able to serve grpc")
 }
 
+var ErrMissingClientTLSInfoForMetricsURL = errors.New("client TLS key/cert (--cert-file, --key-file) must be provided for metrics secure url")
+
+func (e *Etcd) createMetricsListener(murl url.URL) (net.Listener, error) {
+	tlsInfo := &e.cfg.ClientTLSInfo
+	switch murl.Scheme {
+	case "http":
+		tlsInfo = nil
+	case "https", "unixs":
+		if e.cfg.ClientTLSInfo.Empty() {
+			return nil, ErrMissingClientTLSInfoForMetricsURL
+		}
+	}
+	return transport.NewListenerWithOpts(murl.Host, murl.Scheme,
+		transport.WithTLSInfo(tlsInfo),
+		transport.WithSocketOpts(&e.cfg.SocketOpts),
+	)
+}
+
 func (e *Etcd) serveMetrics() (err error) {
 	if e.cfg.Metrics == "extensive" {
 		grpc_prometheus.EnableHandlingTimeHistogram()
@@ -836,22 +893,18 @@ func (e *Etcd) serveMetrics() (err error) {
 
 	if len(e.cfg.ListenMetricsUrls) > 0 {
 		metricsMux := http.NewServeMux()
-		etcdhttp.HandleMetricsHealthForV3(e.cfg.logger, metricsMux, e.Server)
+		etcdhttp.HandleMetrics(metricsMux)
+		etcdhttp.HandleHealth(e.cfg.logger, metricsMux, e.Server)
 
 		for _, murl := range e.cfg.ListenMetricsUrls {
-			tlsInfo := &e.cfg.ClientTLSInfo
-			if murl.Scheme == "http" {
-				tlsInfo = nil
-			}
-			ml, err := transport.NewListenerWithOpts(murl.Host, murl.Scheme,
-				transport.WithTLSInfo(tlsInfo),
-				transport.WithSocketOpts(&e.cfg.SocketOpts),
-			)
+			ml, err := e.createMetricsListener(murl)
 			if err != nil {
 				return err
 			}
 			e.metricsListeners = append(e.metricsListeners, ml)
+			e.wg.Add(1)
 			go func(u url.URL, ln net.Listener) {
+				defer e.wg.Done()
 				e.cfg.logger.Info(
 					"serving metrics",
 					zap.String("address", u.String()),

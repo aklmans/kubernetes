@@ -17,7 +17,7 @@
 REGISTRY ?= staging-k8s.gcr.io
 IMAGE = $(REGISTRY)/pause
 
-TAG ?= 3.9
+TAG ?= 3.10.1
 REV = $(shell git describe --contains --always --match='v*')
 
 # Architectures supported: amd64, arm, arm64, ppc64le and s390x
@@ -69,7 +69,7 @@ TRIPLE.linux-s390x := s390x-linux-gnu
 TRIPLE := ${TRIPLE.${OS}-${ARCH}}
 BASE.linux := scratch
 # Source for windows pause image base is located at https://github.com/microsoft/windows-pause-image-base
-BASE.windows := mcr.microsoft.com/oss/kubernetes/windows-pause-image-base:v0.2
+BASE.windows := mcr.microsoft.com/oss/kubernetes/windows-pause-image-base:v0.4.1@sha256:37cc10768383b55611d724a05eb18564cb5184c89b0c2faa7d4eff63475092df
 BASE := ${BASE.${OS}}
 
 # If you want to build AND push all containers, see the 'all-push' rule.
@@ -118,16 +118,22 @@ bin/${BIN.linux}-$(OS)-$(ARCH): $(SRCS)
 			$(TRIPLE)-strip $(foreach binary, $@, ${binary}${EXTENSION})"
 
 bin/wincat-windows-${ARCH}: windows/wincat/wincat.go
-	CGO_ENABLED=0 GOOS=windows GOARCH=${ARCH} go build -o $@ $^
+	mkdir -p bin
+	docker run --rm -u $$(id -u):$$(id -g) -v $$(pwd):/build \
+		--tmpfs /.cache \
+		$(KUBE_CROSS_IMAGE):$(KUBE_CROSS_VERSION) \
+		/bin/bash -c "\
+		cd /build && \
+		CGO_ENABLED=0 GOOS=windows GOARCH=${ARCH} go build -o $@ $^"
 
 container: .container-${OS}-$(ARCH)
 .container-linux-$(ARCH): bin/$(BIN)-$(OS)-$(ARCH)
-	docker buildx build --pull --output=type=${OUTPUT_TYPE} --platform ${OS}/$(ARCH) \
+	docker buildx build --provenance=false --sbom=false --pull --output=type=${OUTPUT_TYPE} --platform ${OS}/$(ARCH) \
 		-t $(IMAGE):$(TAG)-${OS}-$(ARCH) --build-arg BASE=${BASE} --build-arg ARCH=$(ARCH) .
 	touch $@
 
 .container-windows-$(ARCH): $(foreach binary, ${BIN}, bin/${binary}-${OS}-${ARCH})
-	docker buildx build --pull --output=type=${OUTPUT_TYPE} --platform ${OS}/$(ARCH) \
+	docker buildx build --provenance=false --sbom=false --pull --output=type=${OUTPUT_TYPE} --platform ${OS}/$(ARCH) \
 		-t $(IMAGE):$(TAG)-${OS}-$(ARCH)-${OSVERSION} --build-arg BASE=${BASE}-windows-${OSVERSION}-${ARCH} --build-arg ARCH=$(ARCH) -f Dockerfile_windows .
 	touch $@
 

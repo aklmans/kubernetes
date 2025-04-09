@@ -19,6 +19,7 @@ package e2enode
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -26,7 +27,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubeletstatsv1alpha1 "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2ekubectl "k8s.io/kubernetes/test/e2e/framework/kubectl"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
@@ -40,7 +43,7 @@ import (
 	"github.com/onsi/gomega/types"
 )
 
-var _ = SIGDescribe("Summary API [NodeConformance]", func() {
+var _ = SIGDescribe("Summary API", framework.WithNodeConformance(), func() {
 	f := framework.NewDefaultFramework("summary-test")
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
 	ginkgo.Context("when querying /stats/summary", func() {
@@ -100,6 +103,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						// for more information.
 						"UsageNanoCores":       gomega.SatisfyAny(gstruct.PointTo(gomega.BeZero()), bounded(10000, 2e9)),
 						"UsageCoreNanoSeconds": bounded(10000000, 1e15),
+						"PSI":                  psiExpectation(),
 					}),
 					"Memory": ptrMatchAllFields(gstruct.Fields{
 						"Time": recent(maxStatsAge),
@@ -110,8 +114,10 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						// this now returns /sys/fs/cgroup/memory.stat total_rss
 						"RSSBytes":        bounded(1*e2evolume.Mb, memoryLimit),
 						"PageFaults":      bounded(1000, 1e9),
-						"MajorPageFaults": bounded(0, 100000),
+						"MajorPageFaults": bounded(0, 1e9),
+						"PSI":             psiExpectation(),
 					}),
+					"IO":                 ioExpectation(maxStatsAge),
 					"Swap":               swapExpectation(memoryLimit),
 					"Accelerators":       gomega.BeEmpty(),
 					"Rootfs":             gomega.BeNil(),
@@ -120,12 +126,12 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				})
 			}
 			expectedPageFaultsUpperBound := 1000000
-			expectedMajorPageFaultsUpperBound := 15
+			expectedMajorPageFaultsUpperBound := 1e9
 			if IsCgroup2UnifiedMode() {
 				// On cgroupv2 these stats are recursive, so make sure they are at least like the value set
 				// above for the container.
 				expectedPageFaultsUpperBound = 1e9
-				expectedMajorPageFaultsUpperBound = 100000
+				expectedMajorPageFaultsUpperBound = 1e9
 			}
 
 			podsContExpectations := sysContExpectations().(*gstruct.FieldsMatcher)
@@ -138,6 +144,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 				"RSSBytes":        bounded(1*e2evolume.Kb, memoryLimit),
 				"PageFaults":      bounded(0, expectedPageFaultsUpperBound),
 				"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+				"PSI":             psiExpectation(),
 			})
 			runtimeContExpectations := sysContExpectations().(*gstruct.FieldsMatcher)
 			systemContainers := gstruct.Elements{
@@ -158,7 +165,8 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"WorkingSetBytes": bounded(100*e2evolume.Kb, memoryLimit),
 					"RSSBytes":        bounded(100*e2evolume.Kb, memoryLimit),
 					"PageFaults":      bounded(1000, 1e9),
-					"MajorPageFaults": bounded(0, 100000),
+					"MajorPageFaults": bounded(0, 1e9),
+					"PSI":             psiExpectation(),
 				})
 				systemContainers["misc"] = miscContExpectations
 			}
@@ -174,6 +182,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 							"Time":                 recent(maxStatsAge),
 							"UsageNanoCores":       bounded(10000, 1e9),
 							"UsageCoreNanoSeconds": bounded(10000000, 1e11),
+							"PSI":                  psiExpectation(),
 						}),
 						"Memory": ptrMatchAllFields(gstruct.Fields{
 							"Time":            recent(maxStatsAge),
@@ -183,7 +192,9 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 							"RSSBytes":        bounded(1*e2evolume.Kb, 80*e2evolume.Mb),
 							"PageFaults":      bounded(100, expectedPageFaultsUpperBound),
 							"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+							"PSI":             psiExpectation(),
 						}),
+						"IO":           ioExpectation(maxStatsAge),
 						"Swap":         swapExpectation(memoryLimit),
 						"Accelerators": gomega.BeEmpty(),
 						"Rootfs": ptrMatchAllFields(gstruct.Fields{
@@ -222,6 +233,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"Time":                 recent(maxStatsAge),
 					"UsageNanoCores":       bounded(10000, 1e9),
 					"UsageCoreNanoSeconds": bounded(10000000, 1e11),
+					"PSI":                  psiExpectation(),
 				}),
 				"Memory": ptrMatchAllFields(gstruct.Fields{
 					"Time":            recent(maxStatsAge),
@@ -231,7 +243,9 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"RSSBytes":        bounded(1*e2evolume.Kb, 80*e2evolume.Mb),
 					"PageFaults":      bounded(0, expectedPageFaultsUpperBound),
 					"MajorPageFaults": bounded(0, expectedMajorPageFaultsUpperBound),
+					"PSI":             psiExpectation(),
 				}),
+				"IO":   ioExpectation(maxStatsAge),
 				"Swap": swapExpectation(memoryLimit),
 				"VolumeStats": gstruct.MatchAllElements(summaryObjectID, gstruct.Elements{
 					"test-empty-dir": gstruct.MatchAllFields(gstruct.Fields{
@@ -259,7 +273,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					"InodesUsed":     bounded(0, 1e8),
 				}),
 				"ProcessStats": ptrMatchAllFields(gstruct.Fields{
-					"ProcessCount": bounded(0, 1e8),
+					"ProcessCount": bounded(1, 1e8),
 				}),
 			})
 
@@ -272,6 +286,7 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						"Time":                 recent(maxStatsAge),
 						"UsageNanoCores":       bounded(100e3, 2e9),
 						"UsageCoreNanoSeconds": bounded(1e9, 1e15),
+						"PSI":                  psiExpectation(),
 					}),
 					"Memory": ptrMatchAllFields(gstruct.Fields{
 						"Time":            recent(maxStatsAge),
@@ -281,8 +296,10 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 						// this now returns /sys/fs/cgroup/memory.stat total_rss
 						"RSSBytes":        bounded(1*e2evolume.Kb, memoryLimit),
 						"PageFaults":      bounded(1000, 1e9),
-						"MajorPageFaults": bounded(0, 100000),
+						"MajorPageFaults": bounded(0, 1e9),
+						"PSI":             psiExpectation(),
 					}),
+					"IO":   ioExpectation(maxStatsAge),
 					"Swap": swapExpectation(memoryLimit),
 					// TODO(#28407): Handle non-eth0 network interface names.
 					"Network": ptrMatchAllFields(gstruct.Fields{
@@ -308,6 +325,16 @@ var _ = SIGDescribe("Summary API [NodeConformance]", func() {
 					}),
 					"Runtime": ptrMatchAllFields(gstruct.Fields{
 						"ImageFs": ptrMatchAllFields(gstruct.Fields{
+							"Time":           recent(maxStatsAge),
+							"AvailableBytes": fsCapacityBounds,
+							"CapacityBytes":  fsCapacityBounds,
+							// we assume we are not running tests on machines more than 10tb of disk
+							"UsedBytes":  bounded(e2evolume.Kb, 10*e2evolume.Tb),
+							"InodesFree": bounded(1e4, 1e8),
+							"Inodes":     bounded(1e4, 1e8),
+							"InodesUsed": bounded(0, 1e8),
+						}),
+						"ContainerFs": ptrMatchAllFields(gstruct.Fields{
 							"Time":           recent(maxStatsAge),
 							"AvailableBytes": fsCapacityBounds,
 							"CapacityBytes":  fsCapacityBounds,
@@ -409,9 +436,13 @@ func ptrMatchAllFields(fields gstruct.Fields) types.GomegaMatcher {
 }
 
 func bounded(lower, upper interface{}) types.GomegaMatcher {
-	return gstruct.PointTo(gomega.And(
+	return gstruct.PointTo(boundedValue(lower, upper))
+}
+
+func boundedValue(lower, upper interface{}) types.GomegaMatcher {
+	return gomega.And(
 		gomega.BeNumerically(">=", lower),
-		gomega.BeNumerically("<=", upper)))
+		gomega.BeNumerically("<=", upper))
 }
 
 func swapExpectation(upper interface{}) types.GomegaMatcher {
@@ -481,4 +512,31 @@ func recordSystemCgroupProcesses(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func psiExpectation() types.GomegaMatcher {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return gomega.BeNil()
+	}
+	psiDataExpectation := gstruct.MatchAllFields(gstruct.Fields{
+		"Total":  boundedValue(0, uint64(math.MaxUint64)),
+		"Avg10":  boundedValue(0, 100),
+		"Avg60":  boundedValue(0, 100),
+		"Avg300": boundedValue(0, 100),
+	})
+	return ptrMatchAllFields(gstruct.Fields{
+		"Full": psiDataExpectation,
+		"Some": psiDataExpectation,
+	})
+}
+
+func ioExpectation(maxStatsAge time.Duration) types.GomegaMatcher {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
+		return gomega.BeNil()
+	}
+	return gomega.Or(gomega.BeNil(),
+		ptrMatchAllFields(gstruct.Fields{
+			"Time": recent(maxStatsAge),
+			"PSI":  psiExpectation(),
+		}))
 }

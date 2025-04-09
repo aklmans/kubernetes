@@ -52,9 +52,6 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-
-	// ensure libs have a chance to initialize
-	_ "github.com/stretchr/testify/assert"
 )
 
 const (
@@ -131,7 +128,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 					break
 				}
 			}
-			framework.ExpectNotEqual(group, nil, "admissionregistration.k8s.io API group not found in /apis discovery document")
+			gomega.Expect(group).ToNot(gomega.BeNil(), "admissionregistration.k8s.io API group not found in /apis discovery document")
 
 			ginkgo.By("finding the admissionregistration.k8s.io/v1 API group/version in the /apis discovery document")
 			var version *metav1.GroupVersionForDiscovery
@@ -141,7 +138,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 					break
 				}
 			}
-			framework.ExpectNotEqual(version, nil, "admissionregistration.k8s.io/v1 API group version not found in /apis discovery document")
+			gomega.Expect(version).ToNot(gomega.BeNil(), "admissionregistration.k8s.io/v1 API group version not found in /apis discovery document")
 		}
 
 		{
@@ -159,7 +156,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 					break
 				}
 			}
-			framework.ExpectNotEqual(version, nil, "admissionregistration.k8s.io/v1 API group version not found in /apis/admissionregistration.k8s.io discovery document")
+			gomega.Expect(version).ToNot(gomega.BeNil(), "admissionregistration.k8s.io/v1 API group version not found in /apis/admissionregistration.k8s.io discovery document")
 		}
 
 		{
@@ -182,8 +179,8 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 					validatingWebhookResource = &apiResourceList.APIResources[i]
 				}
 			}
-			framework.ExpectNotEqual(mutatingWebhookResource, nil, "mutatingwebhookconfigurations resource not found in /apis/admissionregistration.k8s.io/v1 discovery document")
-			framework.ExpectNotEqual(validatingWebhookResource, nil, "validatingwebhookconfigurations resource not found in /apis/admissionregistration.k8s.io/v1 discovery document")
+			gomega.Expect(mutatingWebhookResource).ToNot(gomega.BeNil(), "mutatingwebhookconfigurations resource not found in /apis/admissionregistration.k8s.io/v1 discovery document")
+			gomega.Expect(validatingWebhookResource).ToNot(gomega.BeNil(), "validatingwebhookconfigurations resource not found in /apis/admissionregistration.k8s.io/v1 discovery document")
 		}
 	})
 
@@ -440,13 +437,10 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		})
 
 		ginkgo.By("Updating a validating webhook configuration's rules to not include the create operation")
-		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			h, err := admissionClient.ValidatingWebhookConfigurations().Get(ctx, f.UniqueName, metav1.GetOptions{})
-			framework.ExpectNoError(err, "Getting validating webhook configuration")
-			h.Webhooks[0].Rules[0].Operations = []admissionregistrationv1.OperationType{admissionregistrationv1.Update}
-			_, err = admissionClient.ValidatingWebhookConfigurations().Update(ctx, h, metav1.UpdateOptions{})
-			return err
-		})
+		notIncludeCreateOperationFn := func(c *admissionregistrationv1.ValidatingWebhookConfiguration) {
+			c.Webhooks[0].Rules[0].Operations = []admissionregistrationv1.OperationType{admissionregistrationv1.Update}
+		}
+		_, err = updateValidatingWebhookConfigurations(ctx, client, f.UniqueName, notIncludeCreateOperationFn)
 		framework.ExpectNoError(err, "Updating validating webhook configuration")
 
 		ginkgo.By("Creating a configMap that does not comply to the validation webhook rules")
@@ -712,7 +706,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		properly stored in the api-server.  Update the validating webhook configuration and retrieve it; the
 		retrieved object must contain the newly update matchConditions fields.
 	*/
-	ginkgo.It("should be able to create and update validating webhook configurations with match conditions", func(ctx context.Context) {
+	framework.ConformanceIt("should be able to create and update validating webhook configurations with match conditions", func(ctx context.Context) {
 		initalMatchConditions := []admissionregistrationv1.MatchCondition{
 			{
 				Name:       "expression-1",
@@ -729,7 +723,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		ginkgo.By("verifying the validating webhook match conditions")
 		validatingWebhookConfiguration, err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, f.UniqueName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(validatingWebhookConfiguration.Webhooks[0].MatchConditions, initalMatchConditions, "verifying that match conditions are created")
+		gomega.Expect(validatingWebhookConfiguration.Webhooks[0].MatchConditions).To(gomega.Equal(initalMatchConditions), "verifying that match conditions are created")
 		defer func() {
 			err := client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(ctx, validatingWebhookConfiguration.Name, metav1.DeleteOptions{})
 			framework.ExpectNoError(err, "deleting mutating webhook configuration")
@@ -746,14 +740,17 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 				Expression: "object.metadata.namespace == 'staging'",
 			},
 		}
-		validatingWebhookConfiguration.Webhooks[0].MatchConditions = updatedMatchConditions
-		_, err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(ctx, validatingWebhookConfiguration, metav1.UpdateOptions{})
-		framework.ExpectNoError(err)
+
+		updateMatchConditionsFn := func(c *admissionregistrationv1.ValidatingWebhookConfiguration) {
+			c.Webhooks[0].MatchConditions = updatedMatchConditions
+		}
+		_, err = updateValidatingWebhookConfigurations(ctx, client, f.UniqueName, updateMatchConditionsFn)
+		framework.ExpectNoError(err, "Updating validating webhook configuration")
 
 		ginkgo.By("verifying the validating webhook match conditions")
 		validatingWebhookConfiguration, err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, f.UniqueName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(validatingWebhookConfiguration.Webhooks[0].MatchConditions, updatedMatchConditions, "verifying that match conditions are updated")
+		gomega.Expect(validatingWebhookConfiguration.Webhooks[0].MatchConditions).To(gomega.Equal(updatedMatchConditions), "verifying that match conditions are updated")
 	})
 
 	/*
@@ -763,7 +760,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		properly stored in the api-server.  Update the mutating webhook configuration and retrieve it; the
 		retrieved object must contain the newly update matchConditions fields.
 	*/
-	ginkgo.It("should be able to create and update mutating webhook configurations with match conditions", func(ctx context.Context) {
+	framework.ConformanceIt("should be able to create and update mutating webhook configurations with match conditions", func(ctx context.Context) {
 		initalMatchConditions := []admissionregistrationv1.MatchCondition{
 			{
 				Name:       "expression-1",
@@ -780,7 +777,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		ginkgo.By("verifying the mutating webhook match conditions")
 		mutatingWebhookConfiguration, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, f.UniqueName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(mutatingWebhookConfiguration.Webhooks[0].MatchConditions, initalMatchConditions, "verifying that match conditions are created")
+		gomega.Expect(mutatingWebhookConfiguration.Webhooks[0].MatchConditions).To(gomega.Equal(initalMatchConditions), "verifying that match conditions are created")
 		defer func() {
 			err := client.AdmissionregistrationV1().MutatingWebhookConfigurations().Delete(ctx, mutatingWebhookConfiguration.Name, metav1.DeleteOptions{})
 			framework.ExpectNoError(err, "deleting mutating webhook configuration")
@@ -797,14 +794,17 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 				Expression: "object.metadata.namespace == 'staging'",
 			},
 		}
-		mutatingWebhookConfiguration.Webhooks[0].MatchConditions = updatedMatchConditions
-		_, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Update(ctx, mutatingWebhookConfiguration, metav1.UpdateOptions{})
+
+		updateMatchConditionsFn := func(c *admissionregistrationv1.MutatingWebhookConfiguration) {
+			c.Webhooks[0].MatchConditions = updatedMatchConditions
+		}
+		_, err = updateMutatingWebhookConfigurations(ctx, client, f.UniqueName, updateMatchConditionsFn)
 		framework.ExpectNoError(err)
 
 		ginkgo.By("verifying the mutating webhook match conditions")
 		mutatingWebhookConfiguration, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, f.UniqueName, metav1.GetOptions{})
 		framework.ExpectNoError(err)
-		framework.ExpectEqual(mutatingWebhookConfiguration.Webhooks[0].MatchConditions, updatedMatchConditions, "verifying that match conditions are updated")
+		gomega.Expect(mutatingWebhookConfiguration.Webhooks[0].MatchConditions).To(gomega.Equal(updatedMatchConditions), "verifying that match conditions are updated")
 	})
 
 	/*
@@ -814,7 +814,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		matchConditions field. The api-server server should reject the create request with a "compilation
 		failed" error message.
 	*/
-	ginkgo.It("should reject validating webhook configurations with invalid match conditions", func(ctx context.Context) {
+	framework.ConformanceIt("should reject validating webhook configurations with invalid match conditions", func(ctx context.Context) {
 		initalMatchConditions := []admissionregistrationv1.MatchCondition{
 			{
 				Name:       "invalid-expression-1",
@@ -828,7 +828,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		_, err := createValidatingWebhookConfiguration(ctx, f, validatingWebhookConfiguration)
 		gomega.Expect(err).To(gomega.HaveOccurred(), "create validatingwebhookconfiguration should have been denied by the api-server")
 		expectedErrMsg := "compilation failed"
-		gomega.Expect(strings.Contains(err.Error(), expectedErrMsg)).To(gomega.BeTrue())
+		gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring(expectedErrMsg)))
 	})
 
 	/*
@@ -838,7 +838,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		matchConditions field. The api-server server should reject the create request with a "compilation
 		failed" error message.
 	*/
-	ginkgo.It("should reject mutating webhook configurations with invalid match conditions", func(ctx context.Context) {
+	framework.ConformanceIt("should reject mutating webhook configurations with invalid match conditions", func(ctx context.Context) {
 		initalMatchConditions := []admissionregistrationv1.MatchCondition{
 			{
 				Name:       "invalid-expression-1",
@@ -852,7 +852,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		_, err := createMutatingWebhookConfiguration(ctx, f, mutatingWebhookConfiguration)
 		gomega.Expect(err).To(gomega.HaveOccurred(), "create mutatingwebhookconfiguration should have been denied by the api-server")
 		expectedErrMsg := "compilation failed"
-		gomega.Expect(strings.Contains(err.Error(), expectedErrMsg)).To(gomega.BeTrue())
+		gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring(expectedErrMsg)))
 	})
 
 	/*
@@ -863,7 +863,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		a configMap with the name 'skip-me' and verify that it's mutated. Create a
 		configMap with a different name than 'skip-me' and verify that it's mustated.
 	*/
-	ginkgo.It("should mutate everything except 'skip-me' configmaps", func(ctx context.Context) {
+	framework.ConformanceIt("should mutate everything except 'skip-me' configmaps", func(ctx context.Context) {
 		skipMeMatchConditions := []admissionregistrationv1.MatchCondition{
 			{
 				Name:       "skip-me",
@@ -911,7 +911,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 			"mutation-start":   "yes",
 			"mutation-stage-1": "yes",
 		}
-		gomega.Expect(reflect.DeepEqual(expectedConfigMapData, mutatedCM.Data)).To(gomega.BeTrue())
+		gomega.Expect(mutatedCM.Data).Should(gomega.Equal(expectedConfigMapData))
 
 		ginkgo.By("create the configmap with 'skip-me' name")
 
@@ -921,7 +921,7 @@ var _ = SIGDescribe("AdmissionWebhook [Privileged:ClusterAdmin]", func() {
 		expectedConfigMapData = map[string]string{
 			"mutation-start": "yes",
 		}
-		gomega.Expect(reflect.DeepEqual(expectedConfigMapData, skippedCM.Data)).To(gomega.BeTrue())
+		gomega.Expect(skippedCM.Data).Should(gomega.Equal(expectedConfigMapData))
 	})
 })
 
@@ -1915,6 +1915,38 @@ func updateConfigMap(ctx context.Context, c clientset.Interface, ns, name string
 		return false, nil
 	})
 	return cm, pollErr
+}
+
+type updateValidatingWebhookConfigurationsFn func(c *admissionregistrationv1.ValidatingWebhookConfiguration)
+
+func updateValidatingWebhookConfigurations(ctx context.Context, client clientset.Interface, name string,
+	update updateValidatingWebhookConfigurationsFn) (*admissionregistrationv1.ValidatingWebhookConfiguration, error) {
+	var config *admissionregistrationv1.ValidatingWebhookConfiguration
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		config, err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "Getting validating webhook configuration")
+		update(config)
+		config, err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(ctx, config, metav1.UpdateOptions{})
+		return err
+	})
+	return config, err
+}
+
+type updateMutatingWebhookConfigurationsFn func(c *admissionregistrationv1.MutatingWebhookConfiguration)
+
+func updateMutatingWebhookConfigurations(ctx context.Context, client clientset.Interface, name string,
+	update updateMutatingWebhookConfigurationsFn) (*admissionregistrationv1.MutatingWebhookConfiguration, error) {
+	var config *admissionregistrationv1.MutatingWebhookConfiguration
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		config, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Get(ctx, name, metav1.GetOptions{})
+		framework.ExpectNoError(err, "Getting mutating webhook configuration")
+		update(config)
+		config, err = client.AdmissionregistrationV1().MutatingWebhookConfigurations().Update(ctx, config, metav1.UpdateOptions{})
+		return err
+	})
+	return config, err
 }
 
 type updateCustomResourceFn func(cm *unstructured.Unstructured)

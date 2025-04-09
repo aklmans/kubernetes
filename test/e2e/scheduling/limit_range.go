@@ -24,6 +24,9 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+
 	v1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -41,9 +44,6 @@ import (
 	e2eservice "k8s.io/kubernetes/test/e2e/framework/service"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
-
-	"github.com/onsi/ginkgo/v2"
-	"github.com/onsi/gomega"
 )
 
 const (
@@ -223,7 +223,20 @@ var _ = SIGDescribe("LimitRange", func() {
 
 		ginkgo.By("Creating a Pod with more than former max resources")
 		pod = newTestPod(podName+"2", getResourceList("600m", "600Mi", "600Gi"), v1.ResourceList{})
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		// When the LimitRanger admission plugin find 0 items from the LimitRange informer cache,
+		// it will try to lookup LimitRanges from the local LiveLookupCache which liveTTL is 30s.
+		// If a LimitRange was deleted from the apiserver, informer watch the delete event and then
+		// handle it lead to the informer cache doesn't have any other items, but the local LiveLookupCache
+		// has it and not expired at the same time, the LimitRanger admission plugin will use the
+		// deleted LimitRange to validate the request. So the request will be rejected by the plugin
+		// till the item is expired.
+		//
+		// With the following retry, we can make sure the item is expired and the request will be
+		// validated as expected.
+		err = framework.Gomega().Eventually(ctx, func(ctx context.Context) error {
+			_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+			return err
+		}).WithPolling(5 * time.Second).WithTimeout(30 * time.Second).ShouldNot(gomega.HaveOccurred())
 		framework.ExpectNoError(err)
 	})
 
@@ -284,7 +297,7 @@ var _ = SIGDescribe("LimitRange", func() {
 		lrNamespace, err := f.CreateNamespace(ctx, lrName, nil)
 		framework.ExpectNoError(err, "failed creating Namespace")
 		framework.Logf("Namespace %q created", lrNamespace.ObjectMeta.Name)
-		framework.Logf(fmt.Sprintf("Creating LimitRange %q in namespace %q", lrName, lrNamespace.Name))
+		framework.Logf("Creating LimitRange %q in namespace %q", lrName, lrNamespace.Name)
 		_, err = f.ClientSet.CoreV1().LimitRanges(lrNamespace.ObjectMeta.Name).Create(ctx, limitRange2, metav1.CreateOptions{})
 		framework.ExpectNoError(err, "Failed to create limitRange %q in %q namespace", lrName, lrNamespace.ObjectMeta.Name)
 

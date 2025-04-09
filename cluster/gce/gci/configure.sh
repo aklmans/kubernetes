@@ -24,15 +24,14 @@ set -o nounset
 set -o pipefail
 
 ### Hardcoded constants
-DEFAULT_CNI_VERSION='v1.3.0'
-DEFAULT_CNI_HASH='5d0324ca8a3c90c680b6e1fddb245a2255582fa15949ba1f3c6bb7323df9d3af754dae98d6e40ac9ccafb2999c932df2c4288d418949a4915d928eb23c090540'
-DEFAULT_NPD_VERSION='v0.8.9'
-DEFAULT_NPD_HASH_AMD64='4919c47447c5f3871c1dc3171bbb817a38c8c8d07a6ce55a77d43cadc098e9ad608ceeab121eec00c13c0b6a2cc3488544d61ce84cdade1823f3fd5163a952de'
-# TODO (SergeyKanzhelev): fill up for npd 0.8.9+
-DEFAULT_NPD_HASH_ARM64='8ccb42a862efdfc1f25ca9a22f3fd36f9fdff1ac618dd7d39e3b5991505dd610d432364420896ad71f42197a116f28a85dde58b129baa075ebb7312caa57f852'
-DEFAULT_CRICTL_VERSION='v1.28.0'
-DEFAULT_CRICTL_AMD64_SHA512='28824e32c48b9fc70318b2935ce49c3fd923c7855299b609eb2e18c65eee5734abf927aa1929cee3568a3f8fb3cb14aea7a1963271db621f23e3c55674428ed9'
-DEFAULT_CRICTL_ARM64_SHA512='3707b36328c6ebd6ce07cdb31c0680c9cc860d18a568d95da80501ee0dd1666094632f20f7ddebf06718573d4ef21a551c49cf32b646a1c0ac90b3f58c4475fa'
+DEFAULT_CNI_VERSION='v1.6.2'
+DEFAULT_CNI_HASH='23036eea642c55cd38d6a2d8f18837fac78e3d2bc6ec86dc2047dad5e51323efdc8dfd0482ac78fe9f117e4e630d0015e190e4a6a3544fc50dc59e5083459629'
+DEFAULT_NPD_VERSION='v0.8.20'
+DEFAULT_NPD_HASH_AMD64='09029b62f8023885f3a856c20b5fafecabb880806467848ae25f578c4ee6afacd97c85a0c2d0c582c8d79d3716c83d0e7d324073c5816ae5a812812a6f21450b'
+DEFAULT_NPD_HASH_ARM64='233f7e4451de920b7ce8b0ac0e46da1a07ef559e628a75746ce7927492a1886ebd007875f76462d2d0bf3b1dc807a7e8321108cafbd7db9eee39c0e2cfb6c051'
+DEFAULT_CRICTL_VERSION='v1.32.0'
+DEFAULT_CRICTL_AMD64_SHA512='f0edcc1e6c42315e51789255bdff4f6c2a151ad6f92c7de813b0df3a34ea44211c5c2c369b6629090885f834172819a8c113927c695df8818ccc440abdcb517f'
+DEFAULT_CRICTL_ARM64_SHA512='ef0696b59ccae9c535470111c6385d5721047897c14f9b56ddc1893e170d4053afd254b527f05be248100b0980033035a8fba589402fe47966163021cf0e82e3'
 DEFAULT_MOUNTER_TAR_SHA='7956fd42523de6b3107ddc3ce0e75233d2fcb78436ff07a1389b6eaac91fb2b1b72a08f7a219eaf96ba1ca4da8d45271002e0d60e0644e796c665f99bb356516'
 AUTH_PROVIDER_GCP_HASH_LINUX_AMD64="${AUTH_PROVIDER_GCP_HASH_LINUX_AMD64:-156058e5b3994cba91c23831774033e0d505d6d8b80f43541ef6af91b320fd9dfaabe42ec8a8887b51d87104c2b57e1eb895649d681575ffc80dd9aee8e563db}"
 AUTH_PROVIDER_GCP_HASH_LINUX_ARM64="${AUTH_PROVIDER_GCP_HASH_LINUX_ARM64:-1aa3b0bea10a9755231989ffc150cbfa770f1d96932db7535473f7bfeb1108bafdae80202ae738d59495982512e716ff7366d5f414d0e76dd50519f98611f9ab}"
@@ -296,9 +295,14 @@ function install-node-problem-detector {
     return
   fi
 
-  echo "Downloading ${npd_tar}."
-  local -r npd_release_path="${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-https://storage.googleapis.com/kubernetes-release}"
-  download-or-bust "${npd_hash}" "${npd_release_path}/node-problem-detector/${npd_tar}"
+  if [[ -n "${NODE_PROBLEM_DETECTOR_RELEASE_PATH:-}" ]]; then
+    echo "Downloading ${npd_tar} from ${NODE_PROBLEM_DETECTOR_RELEASE_PATH}."
+    local -r download_path="${NODE_PROBLEM_DETECTOR_RELEASE_PATH}/node-problem-detector/${npd_tar}"
+  else
+    echo "Downloading ${npd_tar} from github."
+    local -r download_path="https://github.com/kubernetes/node-problem-detector/releases/download/${npd_version}/${npd_tar}"
+  fi
+  download-or-bust "${npd_hash}" "${download_path}"
   local -r npd_dir="${KUBE_HOME}/node-problem-detector"
   mkdir -p "${npd_dir}"
   tar xzf "${KUBE_HOME}/${npd_tar}" -C "${npd_dir}" --overwrite
@@ -369,7 +373,7 @@ EOF
   fi
 
   echo "Downloading crictl"
-  local -r crictl_path="https://storage.googleapis.com/k8s-artifacts-cri-tools/release/${crictl_version}"
+  local -r crictl_path="https://github.com/kubernetes-sigs/cri-tools/releases/download/${crictl_version}"
   download-or-bust "${crictl_hash}" "${crictl_path}/${crictl}"
   tar xf "${crictl}"
   mv crictl "${KUBE_BIN}/crictl"
@@ -413,8 +417,6 @@ function install-kube-manifests {
   if [[ -e "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" ]]; then
     cp "${dst_dir}/kubernetes/gci-trusty/gke-internal-configure-helper.sh" "${KUBE_BIN}/"
   fi
-
-  cp "${dst_dir}/kubernetes/gci-trusty/health-monitor.sh" "${KUBE_BIN}/health-monitor.sh"
 
   rm -f "${KUBE_HOME}/${manifests_tar}"
   rm -f "${KUBE_HOME}/${manifests_tar}.sha512"
@@ -538,6 +540,46 @@ function install-containerd-ubuntu {
   sudo systemctl start containerd
 }
 
+# If we are on cos we can try to install containerd
+function install-containerd-cos {
+  # bailout if we are not on COS
+  if [ -e /etc/os-release ] && ! grep -q "ID=cos" /etc/os-release; then
+    echo "Unable to automatically install containerd in non-cos image. Bailing out..."
+    exit 2
+  fi
+
+  # Override to latest versions of containerd and runc
+  systemctl stop containerd
+  mkdir -p /home/containerd/
+  mount --bind /home/containerd /home/containerd
+  mount -o remount,exec /home/containerd
+  if [[ -n "${COS_INSTALL_CONTAINERD_VERSION:-}" ]]; then
+    # containerd versions have slightly different url(s), so try both
+    # shellcheck disable=SC2086
+    ( curl ${CURL_FLAGS} \
+        --location \
+        "https://github.com/containerd/containerd/releases/download/${COS_INSTALL_CONTAINERD_VERSION}/containerd-${COS_INSTALL_CONTAINERD_VERSION:1}-${HOST_PLATFORM}-${HOST_ARCH}.tar.gz" \
+      || curl ${CURL_FLAGS} \
+        --location \
+        "https://github.com/containerd/containerd/releases/download/${COS_INSTALL_CONTAINERD_VERSION}/containerd-${COS_INSTALL_CONTAINERD_VERSION:1}.${HOST_PLATFORM}-${HOST_ARCH}.tar.gz" ) \
+    | tar --overwrite -xzv -C /home/containerd/
+    cp /usr/lib/systemd/system/containerd.service /etc/systemd/system/containerd.service
+    # fix the path of the new containerd binary
+    sed -i 's|ExecStart=.*|ExecStart=/home/containerd/bin/containerd|' /etc/systemd/system/containerd.service
+  fi
+  if [[ -n "${COS_INSTALL_RUNC_VERSION:-}" ]]; then
+    # shellcheck disable=SC2086
+    curl ${CURL_FLAGS} \
+      --location \
+      "https://github.com/opencontainers/runc/releases/download/${COS_INSTALL_RUNC_VERSION}/runc.${HOST_ARCH}" --output /home/containerd/bin/runc \
+    && chmod 755 /home/containerd/bin/runc
+    # ensure runc gets picked up from the correct location
+    sed -i "/\[Service\]/a Environment=PATH=/home/containerd/bin:$PATH" /etc/systemd/system/containerd.service
+  fi
+  systemctl daemon-reload
+  sudo systemctl start containerd
+}
+
 function install-auth-provider-gcp {
   local -r filename="auth-provider-gcp"
   local -r auth_provider_storage_full_path="${AUTH_PROVIDER_GCP_STORAGE_PATH}/${AUTH_PROVIDER_GCP_VERSION}/${HOST_PLATFORM}_${HOST_ARCH}/${filename}"
@@ -558,9 +600,9 @@ function install-auth-provider-gcp {
   download-or-bust "${auth_provider_gcp_hash}" "${auth_provider_storage_full_path}"
 
   mv "${KUBE_HOME}/${filename}" "${AUTH_PROVIDER_GCP_LINUX_BIN_DIR}"
-  chmod a+x "${KUBE_BIN}/${filename}"
+  chmod a+x "${AUTH_PROVIDER_GCP_LINUX_BIN_DIR}/${filename}"
 
-  cat >> "${AUTH_PROVIDER_GCP_LINUX_CONF_FILE}" << EOF
+  cat > "${AUTH_PROVIDER_GCP_LINUX_CONF_FILE}" << EOF
 kind: CredentialProviderConfig
 apiVersion: kubelet.config.k8s.io/v1
 providers:
@@ -583,6 +625,9 @@ function ensure-containerd-runtime {
   if [[ -n "${UBUNTU_INSTALL_CONTAINERD_VERSION:-}" || -n "${UBUNTU_INSTALL_RUNC_VERSION:-}" ]]; then
     log-wrap "InstallContainerdUbuntu" install-containerd-ubuntu
   fi
+  if [[ -n "${COS_INSTALL_CONTAINERD_VERSION:-}" || -n "${COS_INSTALL_RUNC_VERSION:-}" ]]; then
+    log-wrap "InstallContainerdCOS" install-containerd-cos
+  fi
 
   # Fall back to installing distro specific containerd, if not found
   if ! command -v containerd >/dev/null 2>&1; then
@@ -593,6 +638,9 @@ function ensure-containerd-runtime {
     case "${linuxrelease}" in
       Ubuntu)
         log-wrap "InstallContainerdUbuntu" install-containerd-ubuntu
+        ;;
+      cos)
+        log-wrap "InstallContainerdCOS" install-containerd-cos
         ;;
       *)
         echo "Installing containerd for linux release ${linuxrelease} not supported" >&2
