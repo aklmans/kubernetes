@@ -26,15 +26,21 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/admission/v1beta1"
+	v1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/apimachinery/pkg/util/wait"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	apiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/pkg/apis/admissionregistration"
 	admissionregistrationv1apis "k8s.io/kubernetes/pkg/apis/admissionregistration/v1"
 	admissionregistrationv1beta1apis "k8s.io/kubernetes/pkg/apis/admissionregistration/v1beta1"
 	"k8s.io/kubernetes/test/integration/etcd"
 	"k8s.io/kubernetes/test/integration/framework"
+	"k8s.io/kubernetes/test/utils/ktesting"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -400,13 +406,38 @@ func createV1ValidatingPolicyAndBinding(client clientset.Interface, convertedRul
 
 // This test shows that policy intercepts all requests for all resources,
 // subresources, verbs, and input versions of policy/binding.
+// The test emulates v1.33 as that was the last version before v1beta1 resource was removed.
+// Remove this test once v1.33 cannot be emulated in v1.37.
+//
+// This test tries to mirror very closely the same test for webhook admission
+// test/integration/apiserver/admissionwebhook/admission_test.go testWebhookAdmission
+func TestPolicyAdmissionV1beta1(t *testing.T) {
+	featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse(vapV1beta1LastEmulatableVersion))
+	testPolicyAdmission(t, true)
+}
+
+// This test shows that policy intercepts all requests for all resources,
+// subresources, verbs, and input versions of policy/binding.
 //
 // This test tries to mirror very closely the same test for webhook admission
 // test/integration/apiserver/admissionwebhook/admission_test.go testWebhookAdmission
 func TestPolicyAdmission(t *testing.T) {
+	testPolicyAdmission(t, false)
+}
+
+func testPolicyAdmission(t *testing.T, supportV1Beta1 bool) {
+	supportedVersions := []string{}
+	if supportV1Beta1 {
+		supportedVersions = append(supportedVersions, "v1beta1")
+	} else {
+		supportedVersions = append(supportedVersions, "v1")
+	}
+
 	holder := &policyExpectationHolder{
+		supportedVersions: supportedVersions,
 		holder: holder{
 			t:                 t,
+			supportedVersions: supportedVersions,
 			gvrToConvertedGVR: map[metav1.GroupVersionResource]metav1.GroupVersionResource{},
 			gvrToConvertedGVK: map[metav1.GroupVersionResource]schema.GroupVersionKind{},
 		},
@@ -530,15 +561,48 @@ func TestPolicyAdmission(t *testing.T) {
 		holder.gvrToConvertedGVK[metaGVR] = schema.GroupVersionKind{Group: resourcesByGVR[convertedGVR].Group, Version: resourcesByGVR[convertedGVR].Version, Kind: resourcesByGVR[convertedGVR].Kind}
 	}
 
-	if err := createV1beta1ValidatingPolicyAndBinding(client, convertedV1beta1Rules); err != nil {
-		t.Fatal(err)
+	if supportV1Beta1 {
+		if err := createV1beta1ValidatingPolicyAndBinding(client, convertedV1beta1Rules); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err := createV1ValidatingPolicyAndBinding(client, convertedV1Rules); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := createV1ValidatingPolicyAndBinding(client, convertedV1Rules); err != nil {
+
+	testConfigmap := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-k8s",
+		},
+	}
+	_, err = client.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), &testConfigmap, metav1.CreateOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Allow the policy & binding to establish
-	time.Sleep(1 * time.Second)
+	_, ctx := ktesting.NewTestContext(t)
+	// Try to patch the configmap and look for the warning message.
+	if err := wait.PollUntilContextTimeout(ctx, time.Millisecond*100, time.Second*5, false, func(ctx context.Context) (bool, error) {
+		holder.reset(t)
+		_, err = client.CoreV1().ConfigMaps(testNamespace).Patch(ctx, testConfigmap.Name, types.JSONPatchType, []byte("[]"), metav1.PatchOptions{})
+		if err != nil {
+			return false, nil
+		}
+		for _, warning := range holder.warnings {
+			if strings.Contains(warning, beginSentinel) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}); err != nil {
+		t.Errorf("timed out waiting policy and binding to establish: %v", err)
+	}
+
+	err = client.CoreV1().ConfigMaps(testNamespace).Delete(ctx, testConfigmap.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Errorf("failed to delete ConfigMap with error: %+v", err)
+	}
 
 	start := time.Now()
 	count := 0
@@ -554,14 +618,15 @@ func TestPolicyAdmission(t *testing.T) {
 						holder.reset(t)
 						testFunc := getTestFunc(gvr, verb)
 						testFunc(&testContext{
-							t:               t,
-							admissionHolder: holder,
-							client:          dynamicClient,
-							clientset:       client,
-							verb:            verb,
-							gvr:             gvr,
-							resource:        resource,
-							resources:       resourcesByGVR,
+							t:                     t,
+							emulateV1beta1Version: supportV1Beta1,
+							admissionHolder:       holder,
+							client:                dynamicClient,
+							clientset:             client,
+							verb:                  verb,
+							gvr:                   gvr,
+							resource:              resource,
+							resources:             resourcesByGVR,
 						})
 						holder.verify(t)
 					})
@@ -583,8 +648,9 @@ func TestPolicyAdmission(t *testing.T) {
 
 type policyExpectationHolder struct {
 	holder
-	warningLock sync.Mutex
-	warnings    []string
+	supportedVersions []string
+	warningLock       sync.Mutex
+	warnings          []string
 }
 
 func (p *policyExpectationHolder) reset(t *testing.T) {
@@ -595,7 +661,7 @@ func (p *policyExpectationHolder) reset(t *testing.T) {
 	p.holder.reset(t)
 
 }
-func (p *policyExpectationHolder) expect(gvr schema.GroupVersionResource, gvk, optionsGVK schema.GroupVersionKind, operation v1beta1.Operation, name, namespace string, object, oldObject, options bool) {
+func (p *policyExpectationHolder) expect(gvr schema.GroupVersionResource, gvk, optionsGVK schema.GroupVersionKind, operation v1.Operation, name, namespace string, object, oldObject, options bool) {
 	p.holder.expect(gvr, gvk, optionsGVK, operation, name, namespace, object, oldObject, options)
 
 	p.lock.Lock()
@@ -604,7 +670,7 @@ func (p *policyExpectationHolder) expect(gvr schema.GroupVersionResource, gvk, o
 	p.recorded = map[webhookOptions]*admissionRequest{}
 	for _, phase := range []string{validation} {
 		for _, converted := range []bool{true, false} {
-			for _, version := range []string{"v1beta1", "v1"} {
+			for _, version := range p.supportedVersions {
 				p.recorded[webhookOptions{version: version, phase: phase, converted: converted}] = nil
 			}
 		}

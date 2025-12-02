@@ -59,7 +59,6 @@ import (
 	flowcontrolv1beta3 "k8s.io/api/flowcontrol/v1beta3"
 	imagepolicyv1alpha1 "k8s.io/api/imagepolicy/v1alpha1"
 	networkingv1 "k8s.io/api/networking/v1"
-	networkingv1alpha1 "k8s.io/api/networking/v1alpha1"
 	networkingv1beta1 "k8s.io/api/networking/v1beta1"
 	nodev1 "k8s.io/api/node/v1"
 	nodev1alpha1 "k8s.io/api/node/v1alpha1"
@@ -69,6 +68,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	rbacv1alpha1 "k8s.io/api/rbac/v1alpha1"
 	rbacv1beta1 "k8s.io/api/rbac/v1beta1"
+	resourcev1 "k8s.io/api/resource/v1"
 	resourcev1alpha3 "k8s.io/api/resource/v1alpha3"
 	resourcev1beta1 "k8s.io/api/resource/v1beta1"
 	resourcev1beta2 "k8s.io/api/resource/v1beta2"
@@ -78,7 +78,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	storagev1alpha1 "k8s.io/api/storage/v1alpha1"
 	storagev1beta1 "k8s.io/api/storage/v1beta1"
-	svmv1alpha1 "k8s.io/api/storagemigration/v1alpha1"
+	svmv1beta1 "k8s.io/api/storagemigration/v1beta1"
 
 	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
 	"k8s.io/apimachinery/pkg/api/apitesting/roundtrip"
@@ -128,7 +128,6 @@ var groups = []runtime.SchemeBuilder{
 	imagepolicyv1alpha1.SchemeBuilder,
 	networkingv1.SchemeBuilder,
 	networkingv1beta1.SchemeBuilder,
-	networkingv1alpha1.SchemeBuilder,
 	nodev1.SchemeBuilder,
 	nodev1alpha1.SchemeBuilder,
 	nodev1beta1.SchemeBuilder,
@@ -140,13 +139,14 @@ var groups = []runtime.SchemeBuilder{
 	resourcev1alpha3.SchemeBuilder,
 	resourcev1beta1.SchemeBuilder,
 	resourcev1beta2.SchemeBuilder,
+	resourcev1.SchemeBuilder,
 	schedulingv1alpha1.SchemeBuilder,
 	schedulingv1beta1.SchemeBuilder,
 	schedulingv1.SchemeBuilder,
 	storagev1alpha1.SchemeBuilder,
 	storagev1beta1.SchemeBuilder,
 	storagev1.SchemeBuilder,
-	svmv1alpha1.SchemeBuilder,
+	svmv1beta1.SchemeBuilder,
 }
 
 func TestRoundTripExternalTypes(t *testing.T) {

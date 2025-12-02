@@ -17,21 +17,27 @@ limitations under the License.
 package resourceslice
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
-	resourceapi "k8s.io/api/resource/v1beta1"
+	resourceapi "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/dynamic-resource-allocation/internal/workqueue"
@@ -64,10 +70,9 @@ func TestControllerSyncPool(t *testing.T) {
 		resourceSlice3 = "resource-slice-3"
 		generateName   = ownerName + "-" + driverName + "-"
 		generatedName1 = generateName + "0"
-		basicDevice    = &resourceapi.BasicDevice{
-			Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
-				"new-attribute": {StringValue: ptr.To("value")},
-			},
+		generatedName2 = generateName + "1"
+		attrs          = map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			"new-attribute": {StringValue: ptr.To("value")},
 		}
 		nodeSelector = &v1.NodeSelector{
 			NodeSelectorTerms: []v1.NodeSelectorTerm{{
@@ -85,11 +90,14 @@ func TestControllerSyncPool(t *testing.T) {
 				}},
 			}},
 		}
-		timeAdded      = metav1.Now()
-		timeAddedLater = metav1.Time{Time: timeAdded.Add(time.Minute)}
+		timeAdded                 = metav1.Time{Time: time.Now().Round(time.Second)}
+		timeAddedLater            = metav1.Time{Time: timeAdded.Add(time.Minute)}
+		timeAddedEarlier          = metav1.Time{Time: timeAdded.Add(-time.Minute)}
+		timeAddedEarlierSubSecond = metav1.Time{Time: timeAddedEarlier.Add(100 * time.Millisecond)}
 	)
 
 	testCases := map[string]struct {
+		features  features
 		syncDelay *time.Duration
 		// nodeUID is empty if not a node-local.
 		nodeUID types.UID
@@ -101,6 +109,7 @@ func TestControllerSyncPool(t *testing.T) {
 		inputDriverResources   *DriverResources
 		expectedResourceSlices []resourceapi.ResourceSlice
 		expectedStats          Stats
+		expectedErrors         []string
 	}{
 		"create-slice": {
 			nodeUID:        nodeUID,
@@ -127,21 +136,21 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Generation: 1,
-						Slices:     []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}},
+						Slices:     []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}},
 					},
 				},
 			},
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -150,14 +159,15 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{{
-							Effect:    resourceapi.DeviceTaintEffectNoExecute,
-							TimeAdded: &timeAdded,
-						}},
-					}}}).
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(
+							deviceName,
+							resourceapi.DeviceTaint{
+								Effect:    resourceapi.DeviceTaintEffectNoExecute,
+								TimeAdded: &timeAdded,
+							},
+						)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
 					Obj(),
 			},
@@ -165,46 +175,48 @@ func TestControllerSyncPool(t *testing.T) {
 				Pools: map[string]Pool{
 					poolName: {
 						Generation: 1,
-						Slices: []Slice{{Devices: []resourceapi.Device{{
-							Name: deviceName,
-							Basic: &resourceapi.BasicDevice{
-								Taints: []resourceapi.DeviceTaint{{
+						Slices: []Slice{{Devices: []resourceapi.Device{
+							newDevice(
+								deviceName,
+								resourceapi.DeviceTaint{
 									Effect: resourceapi.DeviceTaintEffectNoExecute,
 									// No time added here! No need to update the slice.
-								}},
-							}}},
-						}},
+								},
+							),
+						}}},
 					},
 				},
 			},
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{{
-							Effect:    resourceapi.DeviceTaintEffectNoExecute,
-							TimeAdded: &timeAdded,
-						}},
-					}}}).
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(
+							deviceName,
+							resourceapi.DeviceTaint{
+								Effect:    resourceapi.DeviceTaintEffectNoExecute,
+								TimeAdded: &timeAdded,
+							},
+						)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
 					Obj(),
 			},
 		},
-		"add-taint": {
+		"add-taints": {
 			nodeUID: nodeUID,
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{{
-							Effect:    resourceapi.DeviceTaintEffectNoExecute,
-							TimeAdded: &timeAdded,
-						}},
-					}}}).
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(
+							deviceName,
+							resourceapi.DeviceTaint{
+								Effect:    resourceapi.DeviceTaintEffectNoExecute,
+								TimeAdded: &timeAdded,
+							},
+						)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
 					Obj(),
 			},
@@ -212,22 +224,27 @@ func TestControllerSyncPool(t *testing.T) {
 				Pools: map[string]Pool{
 					poolName: {
 						Generation: 1,
-						Slices: []Slice{{Devices: []resourceapi.Device{{
-							Name: deviceName,
-							Basic: &resourceapi.BasicDevice{
-								Taints: []resourceapi.DeviceTaint{
+						Slices: []Slice{{Devices: []resourceapi.Device{
+							newDevice(
+								deviceName,
+								[]resourceapi.DeviceTaint{
 									{
 										Effect: resourceapi.DeviceTaintEffectNoExecute,
 										// No time added here! Time from existing slice must get copied during update.
 									},
 									{
-										Key:       "example.com/tainted",
-										Effect:    resourceapi.DeviceTaintEffectNoSchedule,
-										TimeAdded: &timeAddedLater,
+										Key:    "example.com/tainted",
+										Effect: resourceapi.DeviceTaintEffectNoSchedule,
+										// No time added, will be set to timeAddedLater by reactor.
+									},
+									{
+										Key:       "example.com/tainted2",
+										Effect:    resourceapi.DeviceTaintEffectNoExecute,
+										TimeAdded: &timeAddedEarlierSubSecond, // Gets rounded, both by controller and apiserver roundtripping.
 									},
 								},
-							}}},
-						}},
+							),
+						}}},
 					},
 				},
 			},
@@ -238,24 +255,108 @@ func TestControllerSyncPool(t *testing.T) {
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{
-							{
-								Effect:    resourceapi.DeviceTaintEffectNoExecute,
-								TimeAdded: &timeAdded,
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(
+							deviceName,
+							[]resourceapi.DeviceTaint{
+								{
+									Effect:    resourceapi.DeviceTaintEffectNoExecute,
+									TimeAdded: &timeAdded,
+								},
+								{
+									Key:       "example.com/tainted",
+									Effect:    resourceapi.DeviceTaintEffectNoSchedule,
+									TimeAdded: &timeAddedLater,
+								},
+								{
+									Key:       "example.com/tainted2",
+									Effect:    resourceapi.DeviceTaintEffectNoExecute,
+									TimeAdded: &timeAddedEarlier,
+								},
 							},
-							{
-								Key:       "example.com/tainted",
-								Effect:    resourceapi.DeviceTaintEffectNoSchedule,
-								TimeAdded: &timeAddedLater,
-							},
-						},
-					}}}).
+						)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
 					Obj(),
 			},
+		},
+		"drop-taints": {
+			features: features{disableDeviceTaints: true},
+			nodeUID:  nodeUID,
+			initialObjects: []runtime.Object{
+				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
+					Obj(),
+			},
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{{Devices: []resourceapi.Device{
+							newDevice(
+								deviceName,
+								resourceapi.DeviceTaint{
+									Effect: resourceapi.DeviceTaintEffectNoExecute,
+								},
+							),
+						}}},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumUpdates: 1,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					ResourceVersion("1").
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
+					Obj(),
+			},
+			expectedErrors: []string{`update ResourceSlice: pool "pool", slice #0: some fields were dropped by the apiserver, probably because these features are disabled: DRADeviceTaints`},
+		},
+		"drop-consumable-capacity-field": {
+			features: features{disableConsumableCapacity: true},
+			nodeUID:  nodeUID,
+			initialObjects: []runtime.Object{
+				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
+					Obj(),
+			},
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{{Devices: []resourceapi.Device{
+							newDevice(
+								deviceName,
+								allowMultipleAllocationsField(true),
+							),
+						}}},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumUpdates: 1,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					ResourceVersion("1").
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
+					Obj(),
+			},
+			expectedErrors: []string{`update ResourceSlice: pool "pool", slice #0: some fields were dropped by the apiserver, probably because these features are disabled: DRAConsumableCapacity`},
 		},
 		"remove-pool": {
 			nodeUID:   nodeUID,
@@ -272,7 +373,7 @@ func TestControllerSyncPool(t *testing.T) {
 			},
 			expectedResourceSlices: nil,
 		},
-		"delete-and-add-slice": {
+		"one-existing-and-one-desired-slice-should-be-updated-inplace": {
 			nodeUID: nodeUID,
 			initialObjects: []runtime.Object{
 				// no devices
@@ -284,18 +385,56 @@ func TestControllerSyncPool(t *testing.T) {
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
-						Slices: []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}}},
+						Slices: []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}}},
 				},
 			},
 			expectedStats: Stats{
-				NumDeletes: 1,
+				NumUpdates: 1,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).ResourceVersion("1").
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
+			},
+		},
+		"delete-and-add-slice-when-more-than-one-existing-or-desired-slice": {
+			nodeUID: nodeUID,
+			initialObjects: []runtime.Object{
+				// No devices in first ResourceSlice.
+				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).Devices([]resourceapi.Device{}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).Obj(),
+				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).Obj(),
+			},
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Slices: []Slice{
+							{Devices: []resourceapi.Device{{Name: deviceName1}}},
+							{Devices: []resourceapi.Device{{Name: deviceName2}}},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
 				NumCreates: 1,
+				NumUpdates: 1,
+				NumDeletes: 1,
 			},
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
-					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 1}).Obj(),
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 2}).Obj(),
+				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).ResourceVersion("1").
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 2}).Obj(),
 			},
 		},
 		"delete-redundant-slice": {
@@ -303,17 +442,17 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
-						Slices: []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}}},
+						Slices: []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}}},
 				},
 			},
 			expectedStats: Stats{
@@ -322,7 +461,7 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -331,17 +470,14 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{{
-							Devices: []resourceapi.Device{{
-								Name:  deviceName,
-								Basic: basicDevice,
-							}},
+							Devices: []resourceapi.Device{newDevice(deviceName, attrs)},
 						}},
 					},
 				},
@@ -352,10 +488,7 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name:  deviceName,
-					Basic: basicDevice,
-				}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName, attrs)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -364,7 +497,7 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}, {Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1), newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
@@ -372,11 +505,8 @@ func TestControllerSyncPool(t *testing.T) {
 					poolName: {
 						Slices: []Slice{{
 							Devices: []resourceapi.Device{
-								{Name: deviceName1},
-								{
-									Name:  deviceName2,
-									Basic: basicDevice,
-								},
+								newDevice(deviceName1),
+								newDevice(deviceName2, attrs),
 							},
 						}},
 					},
@@ -388,12 +518,11 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{
-					{Name: deviceName1},
-					{
-						Name:  deviceName2,
-						Basic: basicDevice,
-					}}).
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(deviceName1),
+						newDevice(deviceName2, attrs),
+					}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -402,24 +531,24 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{
-							{Devices: []resourceapi.Device{{Name: deviceName1}}},
-							{Devices: []resourceapi.Device{{Name: deviceName2}}},
-							{Devices: []resourceapi.Device{{Name: deviceName3}}},
+							{Devices: []resourceapi.Device{newDevice(deviceName1)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName2)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName3)}},
 						},
 					},
 				},
@@ -427,15 +556,15 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 		},
@@ -450,7 +579,7 @@ func TestControllerSyncPool(t *testing.T) {
 				// matching device
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 1}).Obj(),
 				// no devices
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
@@ -477,7 +606,7 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -486,24 +615,24 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{
-							{Devices: []resourceapi.Device{{Name: deviceName1}}},
-							{Devices: []resourceapi.Device{{Name: deviceName2, Basic: basicDevice}}},
-							{Devices: []resourceapi.Device{{Name: deviceName3}}},
+							{Devices: []resourceapi.Device{newDevice(deviceName1)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName2, attrs)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName3)}},
 						},
 					},
 				},
@@ -515,15 +644,15 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2, Basic: basicDevice}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2, attrs)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 		},
@@ -532,24 +661,24 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{
-							{Devices: []resourceapi.Device{{Name: deviceName1}}},
-							{Devices: []resourceapi.Device{{Name: deviceName2, Basic: basicDevice}}},
-							{Devices: []resourceapi.Device{{Name: deviceName3, Basic: basicDevice}}},
+							{Devices: []resourceapi.Device{newDevice(deviceName1)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName2, attrs)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName3, attrs)}},
 						},
 					},
 				},
@@ -561,15 +690,15 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).ResourceVersion("1").
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2, Basic: basicDevice}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2, attrs)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 3}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).ResourceVersion("1").
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3, Basic: basicDevice}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3, attrs)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 3}).Obj(),
 			},
 		},
@@ -578,23 +707,23 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{
-							{Devices: []resourceapi.Device{{Name: deviceName1}}},
-							{Devices: []resourceapi.Device{{Name: deviceName2}}},
+							{Devices: []resourceapi.Device{newDevice(deviceName1)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName2)}},
 						},
 					},
 				},
@@ -607,11 +736,11 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).ResourceVersion("1").
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 2}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 2}).Obj(),
 			},
 		},
@@ -620,25 +749,25 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 				MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 3}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Slices: []Slice{
-							{Devices: []resourceapi.Device{{Name: deviceName1}}},
-							{Devices: []resourceapi.Device{{Name: deviceName2}}},
-							{Devices: []resourceapi.Device{{Name: deviceName3}}},
-							{Devices: []resourceapi.Device{{Name: deviceName4}}},
+							{Devices: []resourceapi.Device{newDevice(deviceName1)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName2)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName3)}},
+							{Devices: []resourceapi.Device{newDevice(deviceName4)}},
 						},
 					},
 				},
@@ -650,19 +779,19 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName1}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName1)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 4}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice2).UID(resourceSlice2).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName2}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName2)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 4}).Obj(),
 				*MakeResourceSlice().Name(resourceSlice3).UID(resourceSlice3).ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName3}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName3)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 4}).Obj(),
 				*MakeResourceSlice().GenerateName(generateName).Name(generatedName1).
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName4}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName4)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 2, ResourceSliceCount: 4}).Obj(),
 			},
 		},
@@ -672,7 +801,7 @@ func TestControllerSyncPool(t *testing.T) {
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
-						Slices: []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}},
+						Slices: []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}},
 					},
 				},
 			},
@@ -682,7 +811,7 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(driverName + "-0").GenerateName(driverName + "-").
 					AllNodes(true).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -692,7 +821,7 @@ func TestControllerSyncPool(t *testing.T) {
 				Pools: map[string]Pool{
 					poolName: {
 						NodeSelector: nodeSelector,
-						Slices:       []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}},
+						Slices:       []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}},
 					},
 				},
 			},
@@ -702,7 +831,7 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
 					AppOwnerReferences(ownerName).NodeSelector(nodeSelector).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
@@ -710,14 +839,14 @@ func TestControllerSyncPool(t *testing.T) {
 			initialObjects: []runtime.Object{
 				MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).
 					AppOwnerReferences(ownerName).NodeSelector(nodeSelector).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						NodeSelector: otherNodeSelector,
-						Slices:       []Slice{{Devices: []resourceapi.Device{{Name: deviceName}}}},
+						Slices:       []Slice{{Devices: []resourceapi.Device{newDevice(deviceName)}}},
 					},
 				},
 			},
@@ -727,77 +856,340 @@ func TestControllerSyncPool(t *testing.T) {
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(resourceSlice1).UID(resourceSlice1).ResourceVersion("1").
 					AppOwnerReferences(ownerName).NodeSelector(otherNodeSelector).
-					Driver(driverName).Devices([]resourceapi.Device{{Name: deviceName}}).
+					Driver(driverName).Devices([]resourceapi.Device{newDevice(deviceName)}).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).Obj(),
 			},
 		},
-		"add-shared-counters": {
+		"create-partitionable-devices": {
 			nodeUID: nodeUID,
-			initialObjects: []runtime.Object{
-				MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
-					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{{
-							Effect:    resourceapi.DeviceTaintEffectNoExecute,
-							TimeAdded: &timeAdded,
-						}},
-					}}}).
-					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
-					Obj(),
-			},
 			inputDriverResources: &DriverResources{
 				Pools: map[string]Pool{
 					poolName: {
 						Generation: 1,
-						Slices: []Slice{{Devices: []resourceapi.Device{{
-							Name: deviceName,
-							Basic: &resourceapi.BasicDevice{
-								Taints: []resourceapi.DeviceTaint{
-									{
-										Effect: resourceapi.DeviceTaintEffectNoExecute,
-										// No time added here! Time from existing slice must get copied during update.
+						Slices: []Slice{
+							{
+								PerDeviceNodeSelection: ptr.To(true),
+								SharedCounters: []resourceapi.CounterSet{{
+									Name: "gpu-0",
+									Counters: map[string]resourceapi.Counter{
+										"mem": {Value: resource.MustParse("1")},
 									},
-									{
-										Key:       "example.com/tainted",
-										Effect:    resourceapi.DeviceTaintEffectNoSchedule,
-										TimeAdded: &timeAddedLater,
-									},
+								}},
+							},
+							{
+								PerDeviceNodeSelection: ptr.To(true),
+								Devices: []resourceapi.Device{
+									newDevice(
+										deviceName,
+										nodeNameField(ownerName),
+										[]resourceapi.DeviceCounterConsumption{{
+											CounterSet: "gpu-0",
+											Counters: map[string]resourceapi.Counter{
+												"mem": {Value: resource.MustParse("1")},
+											},
+										}},
+									),
 								},
-							}}},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 2,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					PerDeviceNodeSelection(true).
+					SharedCounters([]resourceapi.CounterSet{{
+						Name: "gpu-0",
+						Counters: map[string]resourceapi.Counter{
+							"mem": {Value: resource.MustParse("1")},
+						},
+					}}).
+					Driver(driverName).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).
+					Obj(),
+				*MakeResourceSlice().Name(generatedName2).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					PerDeviceNodeSelection(true).
+					Driver(driverName).
+					Devices([]resourceapi.Device{
+						newDevice(
+							deviceName,
+							nodeNameField(ownerName),
+							resourceapi.DeviceCounterConsumption{
+								CounterSet: "gpu-0",
+								Counters: map[string]resourceapi.Counter{
+									"mem": {Value: resource.MustParse("1")},
+								},
+							},
+						),
+					}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).
+					Obj(),
+			},
+		},
+		"drop-partitionable-devices": {
+			features: features{disablePartitionableDevices: true},
+			nodeUID:  nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{
+							{
+								PerDeviceNodeSelection: ptr.To(true),
+								SharedCounters: []resourceapi.CounterSet{{
+									Name: "gpu-0",
+									Counters: map[string]resourceapi.Counter{
+										"mem": {Value: resource.MustParse("1")},
+									},
+								}},
+							},
+							{
+								PerDeviceNodeSelection: ptr.To(true),
+								Devices: []resourceapi.Device{
+									newDevice(
+										deviceName,
+										nodeNameField(ownerName),
+										resourceapi.DeviceCounterConsumption{
+											CounterSet: "gpu-0",
+											Counters: map[string]resourceapi.Counter{
+												"mem": {Value: resource.MustParse("1")},
+											},
+										},
+									),
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 2,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).
+					Obj(),
+				*MakeResourceSlice().Name(generatedName2).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 2}).
+					Obj(),
+			},
+			expectedErrors: []string{
+				`create ResourceSlice: pool "pool", slice #0: some fields were dropped by the apiserver, probably because these features are disabled: DRAPartitionableDevices`,
+				`create ResourceSlice: pool "pool", slice #1: some fields were dropped by the apiserver, probably because these features are disabled: DRAPartitionableDevices`,
+			},
+		},
+		"create-device-with-binding-condition": {
+			nodeUID: nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{{
+							Devices: func() []resourceapi.Device {
+								d := newDevice(deviceName)
+								d.BindingConditions = []string{"condition1", "condition2"}
+								d.BindingFailureConditions = []string{"failure-condition1"}
+								d.BindsToNode = ptr.To(true)
+								return []resourceapi.Device{d}
+							}(),
 						}},
 					},
 				},
 			},
 			expectedStats: Stats{
-				NumUpdates: 1,
+				NumCreates: 1,
 			},
 			expectedResourceSlices: []resourceapi.ResourceSlice{
 				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
-					ResourceVersion("1").
 					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
-					Driver(driverName).Devices([]resourceapi.Device{{
-					Name: deviceName,
-					Basic: &resourceapi.BasicDevice{
-						Taints: []resourceapi.DeviceTaint{
-							{
-								Effect:    resourceapi.DeviceTaintEffectNoExecute,
-								TimeAdded: &timeAdded,
-							},
-							{
-								Key:       "example.com/tainted",
-								Effect:    resourceapi.DeviceTaintEffectNoSchedule,
-								TimeAdded: &timeAddedLater,
-							},
-						},
-					}}}).
+					Driver(driverName).
+					Devices(func() []resourceapi.Device {
+						d := newDevice(deviceName)
+						d.BindingConditions = []string{"condition1", "condition2"}
+						d.BindingFailureConditions = []string{"failure-condition1"}
+						d.BindsToNode = ptr.To(true)
+						return []resourceapi.Device{d}
+					}()).
 					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
 					Obj(),
 			},
 		},
+		"drop-device-with-binding-condition": {
+			features: features{disableBindingConditions: true},
+			nodeUID:  nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{{
+							Devices: func() []resourceapi.Device {
+								d := newDevice(deviceName)
+								d.BindingConditions = []string{"condition1", "condition2"}
+								d.BindingFailureConditions = []string{"failure-condition1"}
+								d.BindsToNode = ptr.To(true)
+								return []resourceapi.Device{d}
+							}(),
+						}},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 1,
+			},
+			expectedResourceSlices: []resourceapi.ResourceSlice{
+				*MakeResourceSlice().Name(generatedName1).GenerateName(generateName).
+					NodeOwnerReferences(ownerName, string(nodeUID)).NodeName(ownerName).
+					Driver(driverName).
+					Devices([]resourceapi.Device{newDevice(deviceName)}).
+					Pool(resourceapi.ResourcePool{Name: poolName, Generation: 1, ResourceSliceCount: 1}).
+					Obj(),
+			},
+			expectedErrors: []string{`create ResourceSlice: pool "pool", slice #0: some fields were dropped by the apiserver, probably because these features are disabled: DRADeviceBindingConditions`},
+		},
+		"detect-resource-pools-with-duplicate-counter-sets": {
+			nodeUID: nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{
+							{
+								SharedCounters: []resourceapi.CounterSet{
+									{
+										Name: "counterset",
+									},
+								},
+							},
+							{
+								SharedCounters: []resourceapi.CounterSet{
+									{
+										Name: "counterset",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 0,
+			},
+			expectedErrors: []string{`pool validation failed: found duplicate counter set "counterset" in pool "pool"`},
+		},
+		"detect-duplicate-devices": {
+			nodeUID: nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{
+							{
+								Devices: []resourceapi.Device{
+									{
+										Name: deviceName,
+									},
+								},
+							},
+							{
+								Devices: []resourceapi.Device{
+									{
+										Name: deviceName,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 0,
+			},
+			expectedErrors: []string{`pool validation failed: found duplicate device "device" in pool "pool"`},
+		},
+		"detect-device-referencing-unknown-counter-set": {
+			nodeUID: nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{
+							{
+								Devices: []resourceapi.Device{
+									{
+										Name: deviceName,
+										ConsumesCounters: []resourceapi.DeviceCounterConsumption{
+											{
+												CounterSet: "counterset",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 0,
+			},
+			expectedErrors: []string{`pool validation failed: counter set "counterset" referenced by device "device" not found`},
+		},
+		"detect-device-referencing-unknown-counter-in-counter-set": {
+			nodeUID: nodeUID,
+			inputDriverResources: &DriverResources{
+				Pools: map[string]Pool{
+					poolName: {
+						Generation: 1,
+						Slices: []Slice{
+							{
+								SharedCounters: []resourceapi.CounterSet{
+									{
+										Name: "counterset",
+										Counters: map[string]resourceapi.Counter{
+											"memory": {
+												Value: resource.MustParse("8Gi"),
+											},
+										},
+									},
+								},
+							},
+							{
+								Devices: []resourceapi.Device{
+									{
+										Name: "device",
+										ConsumesCounters: []resourceapi.DeviceCounterConsumption{
+											{
+												CounterSet: "counterset",
+												Counters: map[string]resourceapi.Counter{
+													"cpu": {
+														Value: resource.MustParse("4"),
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedStats: Stats{
+				NumCreates: 0,
+			},
+			expectedErrors: []string{`pool validation failed: counter "cpu" referenced by device "device" not found in counter set "counterset"`},
+		},
 	}
-
 	for name, test := range testCases {
 		t.Run(name, func(t *testing.T) {
 			_, ctx := ktesting.NewTestContext(t)
@@ -811,7 +1203,7 @@ func TestControllerSyncPool(t *testing.T) {
 				}
 				inputObjects = append(inputObjects, initialObject.DeepCopyObject())
 			}
-			kubeClient := createTestClient(inputObjects...)
+			kubeClient := createTestClient(test.features, timeAddedLater, inputObjects...)
 			var queue workqueue.Mock[string]
 			owner := &Owner{
 				APIVersion: "v1",
@@ -829,6 +1221,7 @@ func TestControllerSyncPool(t *testing.T) {
 			if test.noOwner {
 				owner = nil
 			}
+			var controllerErrors []error
 			ctrl, err := newController(ctx, Options{
 				DriverName: driverName,
 				KubeClient: kubeClient,
@@ -836,6 +1229,9 @@ func TestControllerSyncPool(t *testing.T) {
 				Resources:  test.inputDriverResources,
 				Queue:      &queue,
 				SyncDelay:  test.syncDelay,
+				ErrorHandler: func(ctx context.Context, err error, msg string) {
+					controllerErrors = append(controllerErrors, fmt.Errorf("%s: %w", msg, err))
+				},
 			})
 			defer ctrl.Stop()
 			require.NoError(t, err, "unexpected controller creation error")
@@ -847,13 +1243,12 @@ func TestControllerSyncPool(t *testing.T) {
 			ctrl.run(ctx)
 
 			// Check ResourceSlices
-			resourceSlices, err := kubeClient.ResourceV1beta1().ResourceSlices().List(ctx, metav1.ListOptions{})
+			resourceSlices, err := kubeClient.ResourceV1().ResourceSlices().List(ctx, metav1.ListOptions{})
 			require.NoError(t, err, "list resource slices")
 
 			sortResourceSlices(test.expectedResourceSlices)
 			sortResourceSlices(resourceSlices.Items)
 			assert.Equal(t, test.expectedResourceSlices, resourceSlices.Items)
-
 			assert.Equal(t, test.expectedStats, ctrl.GetStats())
 
 			// The informer might have added a work item before or after ctrl.run returned,
@@ -869,8 +1264,74 @@ func TestControllerSyncPool(t *testing.T) {
 			}
 			var expectState workqueue.MockState[string]
 			assert.Equal(t, expectState, actualState)
+
+			// Sync all pools again. Nothing changed, so the statistics should remain the same.
+			if test.inputDriverResources != nil {
+				for poolName := range test.inputDriverResources.Pools {
+					queue.Add(poolName)
+				}
+				ctrl.run(ctx)
+				assert.Equal(t, test.expectedStats, ctrl.GetStats(), "statistics after re-sync")
+			}
+
+			// Dedup the list of errors since we synced the pool twice.
+			var dedupedControllerErrors []error
+			errorMsgs := sets.New[string]()
+			for _, err := range controllerErrors {
+				errorMsg := err.Error()
+				if errorMsgs.Has(errorMsg) {
+					continue
+				}
+				errorMsgs.Insert(errorMsg)
+				dedupedControllerErrors = append(dedupedControllerErrors, err)
+			}
+
+			ctrl.Stop()
+			switch {
+			case len(test.expectedErrors) != 0 && len(dedupedControllerErrors) == 0:
+				t.Errorf("expected errors, got none: %s", joinErrors(test.expectedErrors))
+			case len(test.expectedErrors) == 0 && len(dedupedControllerErrors) > 0:
+				t.Errorf("expected no error, got:\n  %s", joinErrors(formatErrors(controllerErrors)))
+			case len(test.expectedErrors) != len(dedupedControllerErrors):
+				t.Errorf("expected %d errors, got %d:\n  %s", len(test.expectedErrors), len(dedupedControllerErrors), joinErrors(formatErrors(dedupedControllerErrors)))
+			default:
+				expectedErrorsSet := sets.New(test.expectedErrors...)
+				actualErrorsSet := sets.New(errsToStrings(dedupedControllerErrors)...)
+				if !expectedErrorsSet.Equal(actualErrorsSet) {
+					t.Errorf("expected errors:\n  %s\ngot:\n  %s", joinErrors(test.expectedErrors), joinErrors(formatErrors(dedupedControllerErrors)))
+				}
+			}
 		})
 	}
+}
+
+func joinErrors(errors []string) string {
+	return strings.Join(errors, "\n  ")
+}
+
+func errsToStrings(errs []error) []string {
+	var strings []string
+	for _, err := range errs {
+		strings = append(strings, err.Error())
+	}
+	return strings
+}
+
+func formatError(err error) string {
+	var droppedFields *DroppedFieldsError
+	if errors.As(err, &droppedFields) {
+		return fmt.Sprintf("%v\n%s", err, cmp.Diff(droppedFields.DesiredSlice.Spec, droppedFields.ActualSlice.Spec))
+	} else {
+		return err.Error()
+	}
+}
+
+func formatErrors(errs []error) []string {
+	var errMsgs []string
+	for _, err := range errs {
+		errMsgs = append(errMsgs, formatError(err))
+	}
+	return errMsgs
 }
 
 func sortResourceSlices(slices []resourceapi.ResourceSlice) {
@@ -882,17 +1343,24 @@ func sortResourceSlices(slices []resourceapi.ResourceSlice) {
 	})
 }
 
-func createTestClient(objects ...runtime.Object) *fake.Clientset {
+type features struct {
+	disableBindingConditions    bool
+	disableDeviceTaints         bool
+	disablePartitionableDevices bool
+	disableConsumableCapacity   bool
+}
+
+func createTestClient(features features, timeAdded metav1.Time, objects ...runtime.Object) *fake.Clientset {
 	fakeClient := fake.NewSimpleClientset(objects...)
-	fakeClient.PrependReactor("create", "resourceslices", createResourceSliceCreateReactor())
-	fakeClient.PrependReactor("update", "resourceslices", resourceSliceUpdateReactor)
+	fakeClient.PrependReactor("create", "resourceslices", createResourceSliceCreateReactor(features, timeAdded))
+	fakeClient.PrependReactor("update", "resourceslices", createResourceSliceUpdateReactor(features, timeAdded))
 	return fakeClient
 }
 
 // createResourceSliceCreateReactor returns a function which
 // implements the logic required for the GenerateName field to work when using
 // the fake client. Add it with client.PrependReactor to your fake client.
-func createResourceSliceCreateReactor() func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+func createResourceSliceCreateReactor(features features, timeAdded metav1.Time) func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 	nameCounter := 0
 	var mutex sync.Mutex
 	return func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
@@ -903,24 +1371,70 @@ func createResourceSliceCreateReactor() func(action k8stesting.Action) (handled 
 			resourceslice.Name = fmt.Sprintf("%s%d", resourceslice.GenerateName, nameCounter)
 		}
 		nameCounter++
+		dropDisabledFields(features, resourceslice)
+		addTimeAdded(timeAdded, resourceslice)
 		return false, nil, nil
 	}
 }
 
 // resourceSliceUpdateReactor implements the ResourceVersion bump for a fake client.
-func resourceSliceUpdateReactor(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
-	resourceslice := action.(k8stesting.UpdateAction).GetObject().(*resourceapi.ResourceSlice)
-	rev := 0
-	if resourceslice.ResourceVersion != "" {
-		oldRev, err := strconv.Atoi(resourceslice.ResourceVersion)
-		if err != nil {
-			return false, nil, fmt.Errorf("ResourceVersion %q should have been an int: %w", resourceslice.ResourceVersion, err)
+func createResourceSliceUpdateReactor(features features, timeAdded metav1.Time) func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+	return func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+		resourceslice := action.(k8stesting.UpdateAction).GetObject().(*resourceapi.ResourceSlice)
+		rev := 0
+		if resourceslice.ResourceVersion != "" {
+			oldRev, err := strconv.Atoi(resourceslice.ResourceVersion)
+			if err != nil {
+				return false, nil, fmt.Errorf("ResourceVersion %q should have been an int: %w", resourceslice.ResourceVersion, err)
+			}
+			rev = oldRev
 		}
-		rev = oldRev
+		rev++
+		resourceslice.ResourceVersion = fmt.Sprintf("%d", rev)
+		dropDisabledFields(features, resourceslice)
+		addTimeAdded(timeAdded, resourceslice)
+		return false, nil, nil
 	}
-	rev++
-	resourceslice.ResourceVersion = fmt.Sprintf("%d", rev)
-	return false, nil, nil
+}
+
+func dropDisabledFields(features features, resourceslice *resourceapi.ResourceSlice) {
+	if features.disableDeviceTaints {
+		for i := range resourceslice.Spec.Devices {
+			resourceslice.Spec.Devices[i].Taints = nil
+		}
+	}
+	if features.disablePartitionableDevices {
+		resourceslice.Spec.PerDeviceNodeSelection = nil
+		resourceslice.Spec.SharedCounters = nil
+		for i := range resourceslice.Spec.Devices {
+			resourceslice.Spec.Devices[i].NodeName = nil
+			resourceslice.Spec.Devices[i].NodeSelector = nil
+			resourceslice.Spec.Devices[i].ConsumesCounters = nil
+		}
+	}
+	if features.disableBindingConditions {
+		for i := range resourceslice.Spec.Devices {
+			resourceslice.Spec.Devices[i].BindingConditions = nil
+			resourceslice.Spec.Devices[i].BindingFailureConditions = nil
+			resourceslice.Spec.Devices[i].BindsToNode = nil
+		}
+	}
+	if features.disableConsumableCapacity {
+		for i := range resourceslice.Spec.Devices {
+			resourceslice.Spec.Devices[i].AllowMultipleAllocations = nil
+		}
+	}
+}
+
+func addTimeAdded(timeAdded metav1.Time, resourceslice *resourceapi.ResourceSlice) {
+	for i := range resourceslice.Spec.Devices {
+		for e := range resourceslice.Spec.Devices[i].Taints {
+			taint := &resourceslice.Spec.Devices[i].Taints[e]
+			if taint.TimeAdded == nil {
+				taint.TimeAdded = &timeAdded
+			}
+		}
+	}
 }
 
 // ResourceSliceWrapper wraps a ResourceSlice.
@@ -934,8 +1448,7 @@ func MakeResourceSlice() *ResourceSliceWrapper {
 		resourceapi.ResourceSlice{
 			ObjectMeta: metav1.ObjectMeta{},
 			Spec: resourceapi.ResourceSliceSpec{
-				Pool:    resourceapi.ResourcePool{},
-				Devices: []resourceapi.Device{},
+				Pool: resourceapi.ResourcePool{},
 			},
 		},
 	}
@@ -1013,7 +1526,7 @@ func (r *ResourceSliceWrapper) Pool(pool resourceapi.ResourcePool) *ResourceSlic
 
 // NodeName sets the value of ResourceSlice.Spec.NodeName
 func (r *ResourceSliceWrapper) NodeName(nodeName string) *ResourceSliceWrapper {
-	r.Spec.NodeName = nodeName
+	r.Spec.NodeName = refIfNotZero(nodeName)
 	return r
 }
 
@@ -1025,7 +1538,7 @@ func (r *ResourceSliceWrapper) NodeSelector(nodeSelector *v1.NodeSelector) *Reso
 
 // AllNodes sets the value of ResourceSlice.Spec.AllNodes
 func (r *ResourceSliceWrapper) AllNodes(allNodes bool) *ResourceSliceWrapper {
-	r.Spec.AllNodes = allNodes
+	r.Spec.AllNodes = refIfNotZero(allNodes)
 	return r
 }
 
@@ -1033,4 +1546,50 @@ func (r *ResourceSliceWrapper) AllNodes(allNodes bool) *ResourceSliceWrapper {
 func (r *ResourceSliceWrapper) Devices(devices []resourceapi.Device) *ResourceSliceWrapper {
 	r.Spec.Devices = devices
 	return r
+}
+
+// PerDeviceNodeSelection sets ResourceSlice.Spec.PerDeviceNodeSelection.
+func (r *ResourceSliceWrapper) PerDeviceNodeSelection(perDeviceNodeSelection bool) *ResourceSliceWrapper {
+	if perDeviceNodeSelection {
+		r.Spec.PerDeviceNodeSelection = ptr.To(true)
+	} else {
+		r.Spec.PerDeviceNodeSelection = nil
+	}
+	return r
+}
+
+// SharedCounters sets ResourceSlice.Spec.SharedCounters.
+func (r *ResourceSliceWrapper) SharedCounters(counters []resourceapi.CounterSet) *ResourceSliceWrapper {
+	r.Spec.SharedCounters = counters
+	return r
+}
+
+type nodeNameField string
+type allowMultipleAllocationsField bool
+
+func newDevice(name string, fields ...any) resourceapi.Device {
+	device := resourceapi.Device{
+		Name: name,
+	}
+	for _, field := range fields {
+		switch f := field.(type) {
+		case map[resourceapi.QualifiedName]resourceapi.DeviceAttribute:
+			device.Attributes = f
+		case resourceapi.DeviceTaint:
+			device.Taints = append(device.Taints, f)
+		case []resourceapi.DeviceTaint:
+			device.Taints = append(device.Taints, f...)
+		case resourceapi.DeviceCounterConsumption:
+			device.ConsumesCounters = append(device.ConsumesCounters, f)
+		case []resourceapi.DeviceCounterConsumption:
+			device.ConsumesCounters = append(device.ConsumesCounters, f...)
+		case nodeNameField:
+			device.NodeName = ptr.To(string(f))
+		case allowMultipleAllocationsField:
+			device.AllowMultipleAllocations = ptr.To(bool(f))
+		default:
+			panic(fmt.Sprintf("unsupported resourceapi.Device field type %T", field))
+		}
+	}
+	return device
 }

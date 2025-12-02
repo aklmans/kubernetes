@@ -181,7 +181,16 @@ case "${E2E_TEST_DEBUG_TOOL:-ginkgo}" in
     if [[ -n "${GINKGO_PARALLEL_NODES:-}" ]]; then
       program+=("--nodes=${GINKGO_PARALLEL_NODES}")
     elif [[ ${GINKGO_PARALLEL} =~ ^[yY]$ ]]; then
-      program+=("--nodes=25")
+      if [[ "${KUBE_RACE:-}" == "-race" ]]; then
+        # When race detection is enabled, merely running 25 e2e.test instances was too much
+        # and the OOM killer shut down the Prow test pod because of the memory overhead.
+        #
+        # A CI job could control that via GINKGO_PARALLEL_NODES, but we should also have
+        # saner defaults which take this into account.
+        program+=("--nodes=10")
+      else
+        program+=("--nodes=25")
+      fi
     fi
     program+=("${ginkgo_args[@]:+${ginkgo_args[@]}}")
     ;;
@@ -233,7 +242,7 @@ EOF
     kill -TERM "-${GINKGO_CLI_PID}" || true
 
     echo "Waiting for Ginkgo with pid ${GINKGO_CLI_PID}..."
-    wait "{$GINKGO_CLI_PID}"
+    wait "${GINKGO_CLI_PID}"
     echo "Ginkgo terminated."
   fi
 }

@@ -60,8 +60,8 @@ import (
 var controllerKind = batch.SchemeGroupVersion.WithKind("Job")
 
 var (
-	// syncJobBatchPeriod is the batch period for controller sync invocations for a Job.
-	syncJobBatchPeriod = time.Second
+	// syncJobBatchPeriod is the batch period for controller sync invocations for a Job. Exported for tests.
+	SyncJobBatchPeriod = time.Second
 	// DefaultJobApiBackOff is the default API backoff period. Exported for tests.
 	DefaultJobApiBackOff = time.Second
 	// MaxJobApiBackOff is the max API backoff period. Exported for tests.
@@ -109,6 +109,9 @@ type Controller struct {
 	// A store of pods, populated by the podController
 	podStore corelisters.PodLister
 
+	// podIndexer allows looking up pods by ControllerRef UID
+	podIndexer cache.Indexer
+
 	// Jobs that need to be updated
 	queue workqueue.TypedRateLimitingInterface[string]
 
@@ -123,6 +126,10 @@ type Controller struct {
 	// Store with information to compute the expotential backoff delay for pod
 	// recreation in case of pod failures.
 	podBackoffStore *backoffStore
+
+	// finishedJobExpectations contains the job ids for which the job status is finished
+	// but the corresponding event is not yet received.
+	finishedJobExpectations sync.Map
 }
 
 type syncJobCtx struct {
@@ -176,14 +183,15 @@ func newControllerWithClock(ctx context.Context, podInformer coreinformers.PodIn
 			KubeClient: kubeClient,
 			Recorder:   eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
 		},
-		expectations:          controller.NewControllerExpectations(),
-		finalizerExpectations: newUIDTrackingExpectations(),
-		queue:                 workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedItemExponentialFailureRateLimiter[string](DefaultJobApiBackOff, MaxJobApiBackOff), workqueue.TypedRateLimitingQueueConfig[string]{Name: "job", Clock: clock}),
-		orphanQueue:           workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedItemExponentialFailureRateLimiter[orphanPodKey](DefaultJobApiBackOff, MaxJobApiBackOff), workqueue.TypedRateLimitingQueueConfig[orphanPodKey]{Name: "job_orphan_pod", Clock: clock}),
-		broadcaster:           eventBroadcaster,
-		recorder:              eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
-		clock:                 clock,
-		podBackoffStore:       newBackoffStore(),
+		expectations:            controller.NewControllerExpectations(),
+		finalizerExpectations:   newUIDTrackingExpectations(),
+		queue:                   workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedItemExponentialFailureRateLimiter[string](DefaultJobApiBackOff, MaxJobApiBackOff), workqueue.TypedRateLimitingQueueConfig[string]{Name: "job", Clock: clock}),
+		orphanQueue:             workqueue.NewTypedRateLimitingQueueWithConfig(workqueue.NewTypedItemExponentialFailureRateLimiter[orphanPodKey](DefaultJobApiBackOff, MaxJobApiBackOff), workqueue.TypedRateLimitingQueueConfig[orphanPodKey]{Name: "job_orphan_pod", Clock: clock}),
+		broadcaster:             eventBroadcaster,
+		recorder:                eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "job-controller"}),
+		clock:                   clock,
+		podBackoffStore:         newBackoffStore(),
+		finishedJobExpectations: sync.Map{},
 	}
 
 	if _, err := jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -218,6 +226,12 @@ func newControllerWithClock(ctx context.Context, podInformer coreinformers.PodIn
 	jm.podStore = podInformer.Lister()
 	jm.podStoreSynced = podInformer.Informer().HasSynced
 
+	err := controller.AddPodControllerIndexer(podInformer.Informer())
+	if err != nil {
+		return nil, fmt.Errorf("adding Pod controller UID indexer: %w", err)
+	}
+	jm.podIndexer = podInformer.Informer().GetIndexer()
+
 	jm.updateStatusHandler = jm.updateJobStatus
 	jm.patchJobHandler = jm.patchJob
 	jm.syncHandler = jm.syncJob
@@ -230,28 +244,35 @@ func newControllerWithClock(ctx context.Context, podInformer coreinformers.PodIn
 // Run the main goroutine responsible for watching and syncing jobs.
 func (jm *Controller) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
-	logger := klog.FromContext(ctx)
 
 	// Start events processing pipeline.
 	jm.broadcaster.StartStructuredLogging(3)
 	jm.broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: jm.kubeClient.CoreV1().Events("")})
 	defer jm.broadcaster.Shutdown()
 
-	defer jm.queue.ShutDown()
-	defer jm.orphanQueue.ShutDown()
-
+	logger := klog.FromContext(ctx)
 	logger.Info("Starting job controller")
-	defer logger.Info("Shutting down job controller")
 
-	if !cache.WaitForNamedCacheSync("job", ctx.Done(), jm.podStoreSynced, jm.jobStoreSynced) {
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down job controller")
+		jm.queue.ShutDown()
+		jm.orphanQueue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, jm.podStoreSynced, jm.jobStoreSynced) {
 		return
 	}
 
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, jm.worker, time.Second)
-		go wait.UntilWithContext(ctx, jm.orphanWorker, time.Second)
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, jm.worker, time.Second)
+		})
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, jm.orphanWorker, time.Second)
+		})
 	}
-
 	<-ctx.Done()
 }
 
@@ -536,7 +557,14 @@ func (jm *Controller) deleteJob(logger klog.Logger, obj interface{}) {
 			return
 		}
 	}
+	jm.finishedJobExpectations.Delete(jobObj.UID)
 	jm.enqueueLabelSelector(jobObj)
+
+	key := cache.MetaObjectToName(jobObj).String()
+	err := jm.podBackoffStore.removeBackoffRecord(key)
+	if err != nil {
+		utilruntime.HandleError(fmt.Errorf("error removing backoff record %w", err))
+	}
 }
 
 func (jm *Controller) enqueueLabelSelector(jobObj *batch.Job) {
@@ -568,7 +596,7 @@ func (jm *Controller) enqueueSyncJobImmediately(logger klog.Logger, obj interfac
 // - Job status update
 // obj could be an *batch.Job, or a DeletionFinalStateUnknown marker item.
 func (jm *Controller) enqueueSyncJobBatched(logger klog.Logger, obj interface{}) {
-	jm.enqueueSyncJobInternal(logger, obj, syncJobBatchPeriod)
+	jm.enqueueSyncJobInternal(logger, obj, SyncJobBatchPeriod)
 }
 
 // enqueueSyncJobWithDelay tells the controller to invoke syncJob with a
@@ -576,8 +604,8 @@ func (jm *Controller) enqueueSyncJobBatched(logger klog.Logger, obj interface{})
 // It is used when pod recreations are delayed due to pod failures.
 // obj could be an *batch.Job, or a DeletionFinalStateUnknown marker item.
 func (jm *Controller) enqueueSyncJobWithDelay(logger klog.Logger, obj interface{}, delay time.Duration) {
-	if delay < syncJobBatchPeriod {
-		delay = syncJobBatchPeriod
+	if delay < SyncJobBatchPeriod {
+		delay = SyncJobBatchPeriod
 	}
 	jm.enqueueSyncJobInternal(logger, obj, delay)
 }
@@ -746,9 +774,9 @@ func (jm *Controller) getPodsForJob(ctx context.Context, j *batch.Job) ([]*v1.Po
 	if err != nil {
 		return nil, fmt.Errorf("couldn't convert Job selector: %v", err)
 	}
-	// List all pods to include those that don't match the selector anymore
-	// but have a ControllerRef pointing to this controller.
-	pods, err := jm.podStore.Pods(j.Namespace).List(labels.Everything())
+
+	// list all pods managed by this Job using the pod indexer
+	pods, err := controller.FilterPodsByOwner(jm.podIndexer, &j.ObjectMeta, "Job", true)
 	if err != nil {
 		return nil, err
 	}
@@ -841,6 +869,11 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 			// re-syncing here as the record has to be removed for finished/deleted jobs
 			return fmt.Errorf("error removing backoff record %w", err)
 		}
+		jm.finishedJobExpectations.Delete(job.UID)
+		return nil
+	}
+	if _, ok := jm.finishedJobExpectations.Load(job.UID); ok {
+		logger.V(2).Info("Skip syncing the job as its marked finished but the corresponding update event is not yet received", "uid", job.UID, "key", key)
 		return nil
 	}
 
@@ -1014,6 +1047,9 @@ func (jm *Controller) syncJob(ctx context.Context, key string) (rErr error) {
 				if isUpdated {
 					suspendCondChanged = true
 					jm.recorder.Event(&job, v1.EventTypeNormal, "Suspended", "Job suspended")
+					if feature.DefaultFeatureGate.Enabled(features.MutableSchedulingDirectivesForSuspendedJobs) {
+						job.Status.StartTime = nil
+					}
 				}
 			} else {
 				// Job not suspended.
@@ -1304,6 +1340,7 @@ func (jm *Controller) trackJobStatusAndRemoveFinalizers(ctx context.Context, job
 		}
 		if jobFinished {
 			jm.recordJobFinished(jobCtx.job, jobCtx.finishedCondition)
+			jm.finishedJobExpectations.Store(jobCtx.job.UID, struct{}{})
 		}
 		recordJobPodFinished(logger, jobCtx.job, oldCounters)
 	}
@@ -1755,10 +1792,7 @@ func (jm *Controller) manageJob(ctx context.Context, job *batch.Job, jobCtx *syn
 					if completionIndex != unknownCompletionIndex {
 						template = podTemplate.DeepCopy()
 						addCompletionIndexAnnotation(template, completionIndex)
-
-						if feature.DefaultFeatureGate.Enabled(features.PodIndexLabel) {
-							addCompletionIndexLabel(template, completionIndex)
-						}
+						addCompletionIndexLabel(template, completionIndex)
 						template.Spec.Hostname = fmt.Sprintf("%s-%d", job.Name, completionIndex)
 						generateName = podGenerateNameWithIndex(job.Name, completionIndex)
 						if hasBackoffLimitPerIndex(job) {

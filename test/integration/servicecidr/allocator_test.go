@@ -61,11 +61,6 @@ func TestServiceAllocation(t *testing.T) {
 			ipAllocatorGate:      true,
 			disableDualWriteGate: true,
 		},
-		{
-			name:                 "disable dual write with bitmap allocator",
-			ipAllocatorGate:      false,
-			disableDualWriteGate: true,
-		},
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -74,10 +69,10 @@ func TestServiceAllocation(t *testing.T) {
 			s1 := kubeapiservertesting.StartTestServerOrDie(t,
 				apiServerOptions,
 				[]string{
-					"--runtime-config=networking.k8s.io/v1beta1=true",
 					"--service-cluster-ip-range=" + serviceCIDR,
 					"--advertise-address=10.0.0.2",
 					"--disable-admission-plugins=ServiceAccount",
+					"--emulated-version=1.33",
 					fmt.Sprintf("--feature-gates=%s=%v,%s=%v", features.MultiCIDRServiceAllocator, tc.ipAllocatorGate, features.DisableAllocatorDualWrite, tc.disableDualWriteGate),
 				},
 				etcdOptions)
@@ -159,12 +154,9 @@ func TestServiceAllocIPAddressLargeCIDR(t *testing.T) {
 	s1 := kubeapiservertesting.StartTestServerOrDie(t,
 		apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=true",
 			"--service-cluster-ip-range=" + serviceCIDR,
 			"--advertise-address=2001:db8::10",
 			"--disable-admission-plugins=ServiceAccount",
-			// bitmap allocator does not support large service CIDRs set DisableAllocatorDualWrite to false
-			fmt.Sprintf("--feature-gates=%s=true,%s=true", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite),
 		},
 		etcdOptions)
 	defer s1.TearDownFn()
@@ -232,11 +224,9 @@ func TestMigrateService(t *testing.T) {
 	s := kubeapiservertesting.StartTestServerOrDie(t,
 		apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=true",
 			"--service-cluster-ip-range=10.0.0.0/24",
 			"--advertise-address=10.1.1.1",
 			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=true,%s=false", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite),
 		},
 		etcdOptions)
 	defer s.TearDownFn()
@@ -301,6 +291,9 @@ func TestMigrateService(t *testing.T) {
 // TestSkewedAllocatorsRollback creating an apiserver with the new allocator and
 // later starting an old apiserver with the bitmap allocator.
 func TestSkewedAllocatorsRollback(t *testing.T) {
+	// TODO(#134606): Fix or remove this test.
+	t.Skip("Temporarily disabled: see http://issues.k8s.io/134606")
+
 	svc := func(i int) *v1.Service {
 		return &v1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -320,10 +313,8 @@ func TestSkewedAllocatorsRollback(t *testing.T) {
 	// s1 uses IPAddress allocator
 	s1 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=true",
 			"--service-cluster-ip-range=10.0.0.0/24",
-			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=true,%s=true", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite)},
+			"--disable-admission-plugins=ServiceAccount"},
 		etcdOptions)
 	defer s1.TearDownFn()
 
@@ -348,10 +339,10 @@ func TestSkewedAllocatorsRollback(t *testing.T) {
 	// s2 uses bitmap allocator
 	s2 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=false",
 			"--service-cluster-ip-range=10.0.0.0/24",
 			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=false", features.MultiCIDRServiceAllocator)},
+			"--emulated-version=1.33",
+			fmt.Sprintf("--feature-gates=%s=false,%s=false", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite)},
 		etcdOptions)
 	defer s2.TearDownFn()
 
@@ -410,10 +401,10 @@ func TestSkewAllocatorsRollout(t *testing.T) {
 	// oldServer uses bitmap allocator
 	oldServer := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=false",
 			"--service-cluster-ip-range=10.0.0.0/16",
 			"--disable-admission-plugins=ServiceAccount",
-			fmt.Sprintf("--feature-gates=%s=false", features.MultiCIDRServiceAllocator)},
+			"--emulated-version=1.33",
+			fmt.Sprintf("--feature-gates=%s=false,%s=false", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite)},
 		etcdOptions)
 	defer oldServer.TearDownFn()
 
@@ -424,9 +415,9 @@ func TestSkewAllocatorsRollout(t *testing.T) {
 	// s1 uses IPAddress allocator
 	newServer := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
 		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=true",
 			"--service-cluster-ip-range=10.0.0.0/16",
 			"--disable-admission-plugins=ServiceAccount",
+			"--emulated-version=1.33",
 			fmt.Sprintf("--feature-gates=%s=true,%s=false", features.MultiCIDRServiceAllocator, features.DisableAllocatorDualWrite)},
 		etcdOptions)
 	defer newServer.TearDownFn()
@@ -558,10 +549,7 @@ func TestFlagsIPAllocator(t *testing.T) {
 	apiServerOptions := kubeapiservertesting.NewDefaultTestServerOptions()
 	// s1 uses IPAddress allocator
 	s1 := kubeapiservertesting.StartTestServerOrDie(t, apiServerOptions,
-		[]string{
-			"--runtime-config=networking.k8s.io/v1beta1=true",
-			"--service-cluster-ip-range=10.0.0.0/24",
-			fmt.Sprintf("--feature-gates=%s=true", features.MultiCIDRServiceAllocator)},
+		[]string{"--service-cluster-ip-range=10.0.0.0/24"},
 		etcdOptions)
 	defer s1.TearDownFn()
 

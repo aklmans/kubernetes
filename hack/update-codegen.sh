@@ -49,6 +49,11 @@ if [[ "${DBG_CODEGEN}" == 1 ]]; then
     kube::log::status "DBG: starting generated_files"
 fi
 
+echo "installing goimports from hack/tools"
+go -C "${KUBE_ROOT}/hack/tools" install golang.org/x/tools/cmd/goimports
+
+kube::protoc::install
+
 # Generate a list of directories we don't want to play in.
 DIRS_TO_AVOID=()
 kube::util::read-array DIRS_TO_AVOID < <(
@@ -108,9 +113,12 @@ fi
 # Some of the later codegens depend on the results of this, so it needs to come
 # first in the case of regenerating everything.
 function codegen::protobuf() {
-    # NOTE: All output from this script needs to be copied back to the calling
-    # source tree.  This is managed in kube::build::copy_output in build/common.sh.
-    # If the output set is changed update that function.
+    if [[ -n "${LINT:-}" ]]; then                                                             
+        if [[ "${KUBE_VERBOSE}" -gt 2 ]]; then
+            kube::log::status "No linter for protobuf codegen"
+        fi
+        return
+    fi
 
     local apis=()
     kube::util::read-array apis < <(
@@ -133,6 +141,7 @@ function codegen::protobuf() {
     git_find -z \
         ':(glob)**/generated.proto' \
         ':(glob)**/generated.pb.go' \
+        ':(glob)**/generated.protomessage.pb.go' \
         | xargs -0 rm -f
 
     if kube::protoc::check_protoc >/dev/null; then
@@ -627,6 +636,8 @@ function codegen::openapi() {
     # The result file, in each pkg, of open-api generation.
     local output_file="${GENERATED_FILE_PREFIX}openapi.go"
 
+    local output_model_name_file="${GENERATED_FILE_PREFIX}model_name.go"
+
     local output_dir="pkg/generated/openapi"
     local output_pkg="k8s.io/kubernetes/${output_dir}"
     local known_violations_file="${API_KNOWN_VIOLATIONS_DIR}/violation_exceptions.list"
@@ -651,7 +662,7 @@ function codegen::openapi() {
 
     local tag_dirs=()
     kube::util::read-array tag_dirs < <(
-        grep -l --null '+k8s:openapi-gen=' "${tag_files[@]}" \
+        grep -l --null '+k8s:openapi' "${tag_files[@]}" \
             | while read -r -d $'\0' F; do dirname "${F}"; done \
             | sort -u)
 
@@ -673,6 +684,7 @@ function codegen::openapi() {
     fi
 
     git_find -z ':(glob)pkg/generated/**'/"${output_file}" | xargs -0 rm -f
+    git_find -z ':(glob)pkg/generated/**'/"${output_model_name_file}" | xargs -0 rm -f
 
     openapi-gen \
         -v "${KUBE_VERBOSE}" \
@@ -681,6 +693,7 @@ function codegen::openapi() {
         --output-dir "${output_dir}" \
         --output-pkg "${output_pkg}" \
         --report-filename "${report_file}" \
+        --output-model-name-file "${output_model_name_file}" \
         "${tag_pkgs[@]}" \
         "$@"
 
@@ -912,21 +925,16 @@ function codegen::protobindings() {
     # Each element of this array is a directory containing subdirectories which
     # eventually contain a file named "api.proto".
     local apis=(
-        "staging/src/k8s.io/cri-api/pkg/apis/runtime"
-
-        "staging/src/k8s.io/kubelet/pkg/apis/podresources"
-
+        "staging/src/k8s.io/kubelet/pkg/apis/dra"
         "staging/src/k8s.io/kubelet/pkg/apis/deviceplugin"
-
+        "staging/src/k8s.io/kubelet/pkg/apis/podresources"
         "staging/src/k8s.io/kms/apis"
         "staging/src/k8s.io/apiserver/pkg/storage/value/encrypt/envelope/kmsv2"
-
-        "staging/src/k8s.io/kubelet/pkg/apis/dra"
-
         "staging/src/k8s.io/kubelet/pkg/apis/pluginregistration"
         "pkg/kubelet/pluginmanager/pluginwatcher/example_plugin_apis"
-
+        "staging/src/k8s.io/cri-api/pkg/apis/runtime"
         "staging/src/k8s.io/externaljwt/apis"
+        "staging/src/k8s.io/kubelet/pkg/apis/dra-health"
     )
 
     kube::log::status "Generating protobuf bindings for ${#apis[@]} targets"
@@ -938,7 +946,7 @@ function codegen::protobindings() {
     fi
 
     for api in "${apis[@]}"; do
-        git_find -z ":(glob)${api}"/'**/api.pb.go' \
+        git_find -z ":(glob)${api}"/'**/api*.pb.go' \
             | xargs -0 rm -f
     done
 
@@ -946,9 +954,7 @@ function codegen::protobindings() {
       hack/_update-generated-proto-bindings-dockerized.sh "${apis[@]}"
     else
       kube::log::status "protoc ${PROTOC_VERSION} not found (can install with hack/install-protoc.sh); generating containerized..."
-      # NOTE: All output from this script needs to be copied back to the calling
-      # source tree.  This is managed in kube::build::copy_output in build/common.sh.
-      # If the output set is changed update that function.
+
       build/run.sh hack/_update-generated-proto-bindings-dockerized.sh "${apis[@]}"
     fi
 }
